@@ -1,0 +1,58 @@
+# Packaging metadata for Noesis Ebook Translator — Engine (CLI + TUI).
+#
+# NOTE: this project is NOT distributed through PyPI. The engine ships as a
+# native bundle (Windows NSIS installer, Linux AppImage, macOS .dmg) built with
+# PyInstaller by `.github/workflows/release.yml`. The engine itself is a single
+# generated module, `noesis_ebook_translator_engine.py`.
+#
+# The block below exists so tools (editors, `pip install -e .` for developers,
+# CI introspection) can read the metadata and the dependency list.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "noesis-ebook-translator-engine"
+version = "2.4.2"
+description = "CLI + TUI edition of the Noesis Ebook Translator: translate EPUB ebooks using the Ebook Translator engine (verbatim from bookfere's Calibre plugin)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "vigliafg" }]
+keywords = ["epub", "ebook", "translation", "translate", "cli", "tui", "textual"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Natural Language :: Italian",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing :: Linguistic",
+]
+dependencies = [
+    "ebooklib",
+    "lxml",
+    "mechanize",
+    "cssselect",
+]
+
+[project.optional-dependencies]
+tui = ["textual>=0.80"]
+
+[project.urls]
+Homepage = "https://github.com/vigliafg/noesis-ebook-translator-engine"
+Source = "https://github.com/vigliafg/noesis-ebook-translator-engine"
+"Desktop app" = "https://github.com/vigliafg/noesis-ebook-translator"
+"Upstream engine" = "https://github.com/bookfere/Ebook-Translator-Calibre-Plugin"
+
+[project.scripts]
+noesis-ebook-translator-engine = "noesis_ebook_translator_engine:main"
+
+# The generated engine is a flat, single-file module: declare it directly.
+[tool.setuptools]
+py-modules = ["noesis_ebook_translator_engine"]

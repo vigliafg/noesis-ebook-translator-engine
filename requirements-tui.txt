@@ -1,0 +1,6 @@
+# Optional dependencies for the interactive TUI (`-gui`).
+#
+# The CLI works without these; install them (or `pip install .[tui]`) only if
+# you want the modern Textual terminal UI. Without Textual, `-gui` degrades to
+# a simple line-based wizard that needs no extra dependency.
+textual>=0.80

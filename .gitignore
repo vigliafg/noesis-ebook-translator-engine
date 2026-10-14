@@ -1,0 +1,19 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+
+# Packaging / build artifacts
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Local test EPUBs and translation outputs (regenerable)
+*.epub
+work/
+logs/
+out/

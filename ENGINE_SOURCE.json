@@ -1,0 +1,35 @@
+{
+  "desktop_repo": "/home/vigliafg/Documenti/GitHub/noesis-ebook-translator",
+  "desktop_commit": "ec7f311ec3d3fc5746e65e6dad25325f58472c14",
+  "synced_at": "2026-10-14T15:30:38+00:00",
+  "verbatim": [
+    "engines/languages.py",
+    "lib/exception.py",
+    "lib/config.py",
+    "lib/utils.py",
+    "engines/base.py",
+    "engines/genai.py",
+    "engines/google.py",
+    "engines/openai.py",
+    "engines/prompt_extensions.py",
+    "engines/anthropic.py",
+    "engines/deepl.py",
+    "engines/youdao.py",
+    "engines/baidu.py",
+    "engines/microsoft.py",
+    "engines/deepseek.py",
+    "engines/openrouter.py",
+    "engines/custom.py",
+    "lib/element.py",
+    "lib/handler.py",
+    "lib/translation.py",
+    "lib/cache.py",
+    "lib/encodings.py",
+    "appconfig.py",
+    "book.py"
+  ],
+  "overrides": [
+    "engines/__init__.py"
+  ],
+  "frontend": "tools/frontend.py"
+}
