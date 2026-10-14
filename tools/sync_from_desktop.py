@@ -22,6 +22,7 @@ import argparse
 import datetime as _dt
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -70,6 +71,10 @@ OVERRIDES = ["engines/__init__.py"]
 #: Matches the first line of an import statement we must drop when inlining:
 #: anything from ``calibre`` or a relative import (``from .`` / ``from ..``).
 _DROP_IMPORT = re.compile(r"^(from\s+(calibre|\.|__future__)|import\s+calibre\b)")
+
+#: Test fixtures copied from the desktop repo (source of truth), relative to the
+#: repository roots. Kept in sync so both editions test against the same corpus.
+FIXTURE_DIRS = ["tests/data/darwin"]
 
 HEADER = '''#!/usr/bin/env python3
 """Noesis Ebook Translator — Engine (CLI + TUI), single file.
@@ -404,6 +409,25 @@ def _desktop_commit(desktop: Path) -> str:
         return ""
 
 
+def copy_fixtures(desktop: Path) -> int:
+    """Copy the shared test corpus from the desktop repo (best effort)."""
+    copied = 0
+    for rel in FIXTURE_DIRS:
+        src = desktop / rel
+        if not src.is_dir():
+            continue
+        dst = ROOT / rel
+        dst.mkdir(parents=True, exist_ok=True)
+        for item in sorted(src.rglob("*")):
+            if item.is_dir():
+                continue
+            target = dst / item.relative_to(src)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+            copied += 1
+    return copied
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--desktop", type=Path, default=DEFAULT_DESKTOP,
@@ -416,6 +440,8 @@ def main(argv=None) -> int:
     text = build_text(desktop)
     OUTPUT.write_text(text, encoding="utf-8")
 
+    fixtures = copy_fixtures(desktop)
+
     meta = {
         "desktop_repo": str(desktop),
         "desktop_commit": _desktop_commit(desktop),
@@ -423,12 +449,14 @@ def main(argv=None) -> int:
         "verbatim": VERBATIM,
         "overrides": OVERRIDES,
         "frontend": "tools/frontend.py",
+        "fixtures": FIXTURE_DIRS,
     }
     (ROOT / "ENGINE_SOURCE.json").write_text(
         json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
     print(f"wrote {OUTPUT.name}: {len(text.splitlines())} lines, "
           f"{len(CORE_MODULES)} modules + frontend")
+    print(f"copied {fixtures} fixture files from {FIXTURE_DIRS}")
     print(f"desktop commit: {meta['desktop_commit'] or '(unknown)'}")
     return 0
 

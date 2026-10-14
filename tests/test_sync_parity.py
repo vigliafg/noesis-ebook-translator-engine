@@ -38,6 +38,18 @@ class TestSyncParity(unittest.TestCase):
         self.assertIn("desktop_commit", meta)
         self.assertIn("engines/__init__.py", meta.get("overrides", []))
 
+    def test_fixtures_match_desktop(self):
+        # The shared test corpus must be byte-identical to the desktop copy.
+        src = DESKTOP / "tests" / "data" / "darwin"
+        dst = ROOT / "tests" / "data" / "darwin"
+        if not src.is_dir():
+            self.skipTest("desktop corner of the corpus missing")
+        for item in sorted(src.rglob("*")):
+            if item.is_file():
+                self.assertEqual(
+                    (dst / item.relative_to(src)).read_bytes(),
+                    item.read_bytes(), item.name)
+
 
 if __name__ == "__main__":
     unittest.main()

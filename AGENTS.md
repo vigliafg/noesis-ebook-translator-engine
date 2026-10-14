@@ -54,6 +54,10 @@ python tools/sync_from_desktop.py --desktop /percorso/noesis-ebook-translator
 (`desktop_commit`), l'elenco dei moduli **verbatim** e l'**override** locale
 (`engines/__init__.py`), oltre al percorso del front-end (`tools/frontend.py`).
 
+Lo script copia anche il **corpus di test** dal desktop (`tests/data/darwin/`,
+`fixtures` in `ENGINE_SOURCE.json`): le fixture reali usate dalla suite devono
+restare identiche nei due repo.
+
 `tests/test_sync_parity.py` rigenera il testo atteso con
 `sync.build_text(DESKTOP)` e verifica che il file generato sia **byte-identico**;
 **fallisce se è stale** (ricorda di lanciare `tools/sync_from_desktop.py`). Il

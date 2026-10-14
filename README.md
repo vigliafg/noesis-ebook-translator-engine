@@ -368,7 +368,12 @@ La suite include:
 - **test della TUI** che pilotano l'app Textual *reale* headless (si saltano se
   Textual non è installato);
 - **parità di sorgente** con il checkout desktop
-  (`tests/test_sync_parity.py`, si salta se il repo desktop non è presente).
+  (`tests/test_sync_parity.py`, si salta se il repo desktop non è presente);
+- **corpus Darwin**: tre libri reali di **Charles Darwin** (Project Gutenberg,
+  pubblico dominio) in `tests/data/darwin/` — vedi
+  `tests/data/darwin/SOURCE.md`. Le fixture sono **copiate dal repo desktop** da
+  `tools/sync_from_desktop.py`. I test end-to-end le traducono con il motore
+  fittizio; con `NOESIS_ONLINE_TESTS=1` si aggiunge un test reale con Google.
 
 La CI (`.github/workflows/tests.yml`) gira su `ubuntu-latest` (Python 3.12) su
 ogni push e PR: installa `requirements.txt` + `requirements-tui.txt` ed esegue

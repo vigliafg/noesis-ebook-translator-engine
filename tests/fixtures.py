@@ -25,6 +25,8 @@ def load_engine():
 
 def register_fake_engine(module):
     """Add an offline engine that wraps every text in ``IT<...>``."""
+    # Keep test output readable: the engine logs every paragraph at INFO.
+    module.log.level = module.log.ERROR
     if any(getattr(e, "name", None) == "Fake" for e in module.builtin_engines):
         return
 
