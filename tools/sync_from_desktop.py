@@ -74,7 +74,7 @@ _DROP_IMPORT = re.compile(r"^(from\s+(calibre|\.|__future__)|import\s+calibre\b)
 
 #: Test fixtures copied from the desktop repo (source of truth), relative to the
 #: repository roots. Kept in sync so both editions test against the same corpus.
-FIXTURE_DIRS = ["tests/data/darwin"]
+FIXTURE_DIRS = ["tests/data/corpus"]
 
 HEADER = '''#!/usr/bin/env python3
 """Noesis Ebook Translator — Engine (CLI + TUI), single file.

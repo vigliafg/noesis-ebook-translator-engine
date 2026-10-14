@@ -40,8 +40,8 @@ class TestSyncParity(unittest.TestCase):
 
     def test_fixtures_match_desktop(self):
         # The shared test corpus must be byte-identical to the desktop copy.
-        src = DESKTOP / "tests" / "data" / "darwin"
-        dst = ROOT / "tests" / "data" / "darwin"
+        src = DESKTOP / "tests" / "data" / "corpus"
+        dst = ROOT / "tests" / "data" / "corpus"
         if not src.is_dir():
             self.skipTest("desktop corner of the corpus missing")
         for item in sorted(src.rglob("*")):

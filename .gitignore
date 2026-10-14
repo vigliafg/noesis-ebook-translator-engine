@@ -15,7 +15,7 @@ dist/
 # Local test EPUBs and translation outputs (regenerable)
 *.epub
 # …but the committed Darwin test corpus is tracked on purpose.
-!tests/data/darwin/*.epub
+!tests/data/corpus/*.epub
 work/
 logs/
 out/
