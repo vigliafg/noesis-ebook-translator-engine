@@ -58,6 +58,9 @@ CORE_MODULES = [
     "lib/translation.py",
     "lib/cache.py",
     "lib/encodings.py",
+    "chapters.py",
+    "extract.py",
+    "exporter.py",
     "appconfig.py",
     "book.py",
 ]

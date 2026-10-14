@@ -26,6 +26,45 @@ def _print_engine_list() -> None:
             print(f"      models: {', '.join(models)}")
 
 
+def _print_chapters(path: str) -> None:
+    for chapter in flatten(load_chapters(path)):
+        indent = "  " * chapter.depth
+        label = chapter.name or chapter.file or "(section)"
+        print(f"  {chapter.index:>3}  {indent}{label}")
+
+
+def _selected_chapters(path: str, spec):
+    if not spec:
+        return None
+    return resolve_selection(load_chapters(path), spec)
+
+
+def _export_extra(args) -> int:
+    out = args.output
+    if args.export_only in ("figures", "tables"):
+        if not out or not os.path.splitext(out)[1] or os.path.isdir(out):
+            out_dir = out or "."
+        else:
+            out_dir = os.path.dirname(out) or "."
+        os.makedirs(out_dir, exist_ok=True)
+    else:  # text writes a file
+        out_dir = os.path.dirname(out) if out else "."
+    selected = _selected_chapters(args.input, args.chapters)
+    if args.export_only == "figures":
+        figures = extract_figures(args.input, selected=selected)
+        paths = export_figures(figures, out_dir, args.export_format or "img")
+    elif args.export_only == "tables":
+        tables = extract_tables(args.input, selected=selected)
+        paths = export_tables(tables, out_dir, args.export_format or "csv")
+    else:  # text
+        target = args.output or default_output_path(args.input).rsplit(".", 1)[0] + ".txt"
+        paths = export_text(args.input, target, selected=selected)
+    for path in paths:
+        print(path)
+    print(f"{len(paths)} file(s) written")
+    return 0
+
+
 def _cli_progress(fraction: float, message: str) -> None:
     bar_len = 30
     done = int(max(0.0, min(1.0, fraction)) * bar_len)
@@ -53,24 +92,35 @@ def _build_settings(args) -> dict:
 
 def run_cli(args) -> int:
     ensure_defaults()
-    output = args.output or default_output_path(args.input, args.target)
     settings = _build_settings(args)
     engine = args.engine or "Google(Free)New"
+    selected = _selected_chapters(args.input, args.chapters) if args.chapters else None
+    target = args.output or default_output_path(args.input, args.target)
+    fmt = (args.export_format or "epub").lower()
 
     print(f"Engine : {engine}")
     print(f"Input  : {args.input}")
-    print(f"Output : {output}")
+    if selected:
+        print(f"Chapters: {', '.join((c.name or c.file or '?') for c in selected)}")
+    print(f"Output : {target}{'' if fmt == 'epub' else ' (' + fmt + ')'}")
     print(f"{args.source} -> {args.target}\n")
 
     def log(text: str, error: bool = False) -> None:
         if error:
             sys.stderr.write(text + "\n")
 
+    work_target = target if fmt == "epub" else \
+        tempfile.mkdtemp(prefix="noesis-engine-") + "/translated.epub"
+
     try:
         path = translate_epub(
-            args.input, output, engine=engine,
+            args.input, work_target, engine=engine,
             source_lang=args.source, target_lang=args.target,
+            chapters=args.chapters or None,
             settings=settings, on_progress=_cli_progress, on_log=log)
+        if fmt != "epub":
+            written = export_chapters(path, target, None, fmt)
+            path = written[0]
     except KeyboardInterrupt:
         print("\nCanceled.", file=sys.stderr)
         return 130
@@ -78,6 +128,20 @@ def run_cli(args) -> int:
         print(f"\nError: {exc}", file=sys.stderr)
         return 1
     print(f"Done: {path}")
+    return 0
+
+
+def run_preview(args) -> int:
+    ensure_defaults()
+    pairs = preview_translation(
+        args.input, engine=args.engine or "Google(Free)New",
+        source_lang=args.source, target_lang=args.target,
+        chapters=args.chapters or None, limit=args.preview,
+        settings=_build_settings(args))
+    for original, translation in pairs:
+        print(f"─ {original}")
+        print(f"→ {translation}\n")
+    print(f"{len(pairs)} segment(s) previewed")
     return 0
 
 
@@ -238,6 +302,17 @@ def main(argv=None) -> int:
     parser.add_argument("-t", "--target", default="Italian", help="target language")
     parser.add_argument("--position", choices=["only", "below", "above"],
                         help="translation position (default: only)")
+    parser.add_argument("--chapters", help="translate/export only these chapters "
+                        "(1-based list like 1,3,5-7, or hrefs)")
+    parser.add_argument("--export-format",
+                        help="output format: epub|html|md|txt (chapters), "
+                             "img|html|md (figures), csv|html|md (tables)")
+    parser.add_argument("--export-only", choices=["figures", "tables", "text"],
+                        help="extract instead of translating")
+    parser.add_argument("--preview", type=int, metavar="N",
+                        help="show N translated segments and exit")
+    parser.add_argument("--list-chapters", action="store_true",
+                        help="list the book chapters and exit")
     parser.add_argument("--batch", action="store_true", help="enable online batching")
     parser.add_argument("--no-cache", action="store_true", help="disable the cache")
     parser.add_argument("--api-key", help="API key for the selected engine")
@@ -255,10 +330,19 @@ def main(argv=None) -> int:
     if args.list_engines:
         _print_engine_list()
         return 0
+    if args.list_chapters:
+        if not args.input:
+            parser.error("--list-chapters requires an input EPUB")
+        _print_chapters(args.input)
+        return 0
     if args.gui:
         return run_tui()
     if not args.input:
         parser.error("the input EPUB file is required (or use -gui)")
+    if args.preview:
+        return run_preview(args)
+    if args.export_only:
+        return _export_extra(args)
     return run_cli(args)
 
 
