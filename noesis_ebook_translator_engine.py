@@ -5883,10 +5883,18 @@ from dataclasses import dataclass, field
 from ebooklib import epub
 from lxml import etree
 
+XHTML = "{http://www.w3.org/1999/xhtml}"
+
 __all__ = [
     "Chapter", "load_chapters", "flatten", "resolve_selection",
-    "chapter_files", "book_meta",
+    "chapter_files", "book_meta", "isolate_chapters",
 ]
+
+
+def _fragment_of(href: str | None) -> str | None:
+    if href and "#" in href:
+        return href.split("#", 1)[1] or None
+    return None
 
 
 @dataclass
@@ -6041,6 +6049,109 @@ def resolve_selection(chapters: list[Chapter], spec) -> list[Chapter]:
     wanted = {str(x) for x in spec}
     return [c for c in flat
             if c.href in wanted or c.file in wanted or str(c.index) in wanted]
+
+
+# ---------------------------------------------------------------------------
+#  Anchor-aware isolation (chapters that share one XHTML file)
+# ---------------------------------------------------------------------------
+def _iter_chapters(chapters):
+    for chapter in chapters or []:
+        yield from chapter.walk()
+
+
+def _toc_anchor_map(book) -> dict[str, set[str]]:
+    """Return ``{file_name: {anchor, ...}}`` from the (current) TOC."""
+    anchors: dict[str, set[str]] = {}
+
+    def walk(items):
+        for item in items or []:
+            if isinstance(item, (tuple, list)) and item:
+                walk([item[0]])
+                if len(item) > 1:
+                    walk(item[1])
+                continue
+            href = getattr(item, "href", None)
+            file_name = _file_of(href)
+            fragment = _fragment_of(href)
+            if file_name and fragment:
+                anchors.setdefault(file_name, set()).add(fragment)
+
+    walk(book.toc)
+    return anchors
+
+
+def isolate_chapters(book, selected) -> None:
+    """Trim kept documents to the selected chapters' anchor ranges.
+
+    When several TOC entries are anchors inside the *same* XHTML file (e.g.
+    ``part.xhtml#ch2``), restricting by file keeps the whole file (previous and
+    next chapters included). This keeps only the ``[anchor, next_anchor)`` ranges
+    of the selected chapters. Chapters without an anchor keep the whole file.
+    """
+    anchors = _toc_anchor_map(book)
+    wanted: dict[str, set[str] | None] = {}
+    for chapter in _iter_chapters(selected):
+        if not chapter.file:
+            continue
+        fragment = _fragment_of(chapter.href)
+        if fragment is None:
+            wanted[chapter.file] = None  # whole file requested
+        elif wanted.get(chapter.file, set()) is not None:
+            wanted.setdefault(chapter.file, set()).add(fragment)
+
+    for item in book.get_items():
+        if item.get_type() != 9 or item.file_name not in wanted:
+            continue
+        anchor_set = wanted[item.file_name]
+        if anchor_set is None:
+            continue
+        _trim_item_to_anchors(item, anchor_set, anchors.get(item.file_name, set()))
+
+
+def _trim_item_to_anchors(item, wanted: set[str], all_anchors: set[str]) -> None:
+    if not wanted or not all_anchors:
+        return
+    try:
+        root = etree.fromstring(
+            item.get_content(),
+            parser=etree.XMLParser(recover=True, resolve_entities=False))
+    except Exception:  # noqa: BLE001 - malformed item, leave as-is
+        return
+    body = root.find(f".//{XHTML}body")
+    if body is None:
+        body = root.find(".//body")
+    if body is None:
+        return
+
+    order = {el: index for index, el in enumerate(root.iter())}
+    anchor_pos: dict[str, int] = {}
+    for el in root.iter():
+        element_id = el.get("id")
+        if element_id and element_id in all_anchors and element_id not in anchor_pos:
+            anchor_pos[element_id] = order.get(el, 0)
+    if not anchor_pos:
+        return
+    ordered = sorted(anchor_pos.items(), key=lambda pair: pair[1])
+
+    def segment_of(element) -> str | None:
+        position = order.get(element, 0)
+        current = None
+        for anchor, anchor_position in ordered:
+            if anchor_position <= position:
+                current = anchor
+            else:
+                break
+        return current
+
+    removed = False
+    for child in list(body):
+        segment = segment_of(child)
+        if segment is None or segment not in wanted:
+            body.remove(child)
+            removed = True
+    if removed:
+        item.set_content(etree.tostring(
+            root, encoding="utf-8", method="xml", xml_declaration=True))
 
 
 def book_meta(epub_path: str) -> dict:
@@ -6219,6 +6330,8 @@ def extract_figures(epub_path: str, chapters: list[Chapter] | None = None,
                     selected: list[Chapter] | None = None) -> list[Figure]:
     book = epub.read_epub(epub_path)
     files = chapter_files(selected) if selected else None
+    if selected:
+        isolate_chapters(book, selected)
     figures: list[Figure] = []
     for doc in _ordered_documents(book, files):
         doc_chapter, doc_name = _chapter_index(chapters, doc.file_name)
@@ -6243,6 +6356,8 @@ def extract_tables(epub_path: str, chapters: list[Chapter] | None = None,
                    selected: list[Chapter] | None = None) -> list[Table]:
     book = epub.read_epub(epub_path)
     files = chapter_files(selected) if selected else None
+    if selected:
+        isolate_chapters(book, selected)
     tables: list[Table] = []
     for doc in _ordered_documents(book, files):
         doc_chapter, doc_name = _chapter_index(chapters, doc.file_name)
@@ -6281,6 +6396,8 @@ def extract_text(epub_path: str, chapters: list[Chapter] | None = None,
     """Return ``[(chapter_index, chapter_name, segment_text), ...]``."""
     book = epub.read_epub(epub_path)
     files = chapter_files(selected) if selected else None
+    if selected:
+        isolate_chapters(book, selected)
     out: list[tuple[int, str, str]] = []
     for doc in _ordered_documents(book, files):
         doc_chapter, doc_name = _chapter_index(chapters, doc.file_name)
@@ -6565,6 +6682,7 @@ def export_epub(input_path: str, output_path: str,
     book = _read(input_path)
     if selected:
         restrict_book(book, chapter_files(selected))
+        isolate_chapters(book, selected)
     _ensure_toc_uids(book.toc)
     epub.write_epub(output_path, book)
     return [output_path]
@@ -6605,6 +6723,8 @@ def export_html(input_path: str, output_path: str,
                 title: str | None = None) -> list[str]:
     book = _read(input_path)
     files = chapter_files(selected) if selected else None
+    if selected:
+        isolate_chapters(book, selected)
     parts = ["<!DOCTYPE html>", '<html><head><meta charset="utf-8">',
              f"<title>{title or os.path.basename(input_path)}</title>",
              "<style>body{font-family:serif;line-height:1.5;margin:2rem;} "
@@ -6631,6 +6751,8 @@ def export_markdown(input_path: str, output_path: str,
                     selected: list[Chapter] | None = None) -> list[str]:
     book = _read(input_path)
     files = chapter_files(selected) if selected else None
+    if selected:
+        isolate_chapters(book, selected)
     assets = Path(output_path).with_suffix("")
     assets = assets.parent / (assets.name + "_files")
     written: list[str] = []
@@ -7183,6 +7305,7 @@ def translate_epub(
         all_chapters = chapters_from_book(book)
         selected = resolve_selection(all_chapters, chapters)
         restrict_book(book, chapter_files(selected))
+        isolate_chapters(book, selected)
     pages = _parse_pages(book)
     toc_nodes = _parse_toc(book.toc)
 
@@ -7269,6 +7392,7 @@ def preview_translation(
     if chapters:
         selected = resolve_selection(chapters_from_book(book), chapters)
         restrict_book(book, chapter_files(selected))
+        isolate_chapters(book, selected)
     pages = _parse_pages(book)
 
     handler = get_element_handler(
