@@ -1,7 +1,7 @@
 {
   "desktop_repo": "/home/vigliafg/Documenti/GitHub/noesis-ebook-translator",
-  "desktop_commit": "2ac297eace8825b3d5a95108bcb0126d9bb8ce6d",
-  "synced_at": "2026-10-16T09:29:53+00:00",
+  "desktop_commit": "60a61fdbc076f8a2971b4446276347342289abdd",
+  "synced_at": "2026-10-16T09:44:16+00:00",
   "verbatim": [
     "engines/languages.py",
     "lib/exception.py",
