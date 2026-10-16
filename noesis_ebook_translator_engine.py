@@ -7056,6 +7056,22 @@ APP_DEFAULTS: dict[str, Any] = {
     "reader_backend": "auto",
     "reduce_motion": False,
     "onboarding_done": False,
+    # Reader defaults (separate theme from the app).
+    "reader_theme": "light",
+    "reader_font": "serif",
+    "reader_line_height": 1.5,
+    "reader_justify": True,
+    "reader_hyphenate": True,
+    "reader_flow": "paginated",
+    "reader_spread": False,
+    # Quality defaults.
+    "quality_samples": 10,
+    "quality_threshold": 60,
+    "quality_judge_engine": "",
+    # Export defaults.
+    "export_format": "epub",
+    "export_edition": "original",
+    "output_dir": "",
     # Reserve anchors/links so navigation targets and footnote references survive
     # translation. Emphasis tags (em/i/b/…) are intentionally NOT reserved: their
     # text must be translated, so the tag is dropped in favour of correct text.
@@ -7065,7 +7081,8 @@ APP_DEFAULTS: dict[str, Any] = {
 }
 
 #: Preference keys surfaced by the GUI for the selected engine.
-_ENGINE_PREFERENCE_KEYS = ("api_keys", "model", "prompt", "target_lang")
+_ENGINE_PREFERENCE_KEYS = (
+    "api_keys", "model", "prompt", "target_lang", "concurrency_limit")
 
 
 def ensure_defaults() -> None:
@@ -7127,10 +7144,23 @@ def get_engine_preference(engine_name: str) -> dict[str, Any]:
 
 
 def set_engine_preference(engine_name: str, **values: Any) -> None:
+    """Store per-engine preferences (``api_keys``, ``model``, …).
+
+    A value of ``None`` **removes** the key: this matters for
+    ``concurrency_limit``, where ``0`` is meaningful ("as many workers as
+    segments") and is *not* the neutral value -- removing the key lets the engine
+    class default apply again.
+    """
     config = get_config()
     preferences = config.get("engine_preferences") or {}
     data = dict(preferences.get(engine_name) or {})
-    data.update({k: v for k, v in values.items() if k in _ENGINE_PREFERENCE_KEYS})
+    for key, value in values.items():
+        if key not in _ENGINE_PREFERENCE_KEYS:
+            continue
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
     preferences[engine_name] = data
     config.set("engine_preferences", preferences)
     config.commit()
@@ -7281,6 +7311,7 @@ def translate_epub(
     on_progress: Callable[[float, str], None] | None = None,
     on_log: Callable[[str, bool], None] | None = None,
     on_paragraph: Callable[[Any], None] | None = None,
+    on_plan: Callable[[dict[str, int]], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> str:
     """Translate ``input_path`` and return the path of the written EPUB."""
@@ -7317,6 +7348,20 @@ def translate_epub(
     elements.extend(get_toc_elements(toc_nodes, []))
     elements.extend(get_page_elements(pages))
     originals = handler.prepare_original(elements)
+
+    # Report the per-document segment totals *before* translating: the GUI uses
+    # them to show real per-chapter progress (and chapter completion) instead of
+    # a linear estimate. ``originals`` entries are
+    # ``(id, md5, raw, content, ignored, attributes, page_id)``.
+    if on_plan is not None:
+        counts: dict[str, int] = {}
+        for entry in originals:
+            if entry[4]:      # ignored element
+                continue
+            page = entry[6]   # page_id = XHTML file name (or "toc.ncx")
+            if page and page != "toc.ncx":
+                counts[page] = counts.get(page, 0) + 1
+        on_plan(counts)
 
     # Cache persists translations across runs (deduplicated by content).
     encoding = ""
