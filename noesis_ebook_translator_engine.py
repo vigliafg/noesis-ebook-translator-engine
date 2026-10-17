@@ -4693,7 +4693,7 @@ PROBE_TEXT = "Hello"
 
 
 def test_model(provider_id: str, api_key: str, model: str, *,
-               translator: Any = None,
+               translator: Any = None, endpoint: str = "",
                source_lang: str = "English", target_lang: str = "Italian",
                request_attempt: int = 1, request_timeout: float = 15.0,
                text: str = PROBE_TEXT) -> TestResult:
@@ -4702,7 +4702,11 @@ def test_model(provider_id: str, api_key: str, model: str, *,
     Performs a **single short translation** (one attempt, short timeout) — the
     only honest check that a model works for this app. ``translator`` may be
     injected (tests); otherwise the engine registered for the provider is built
-    from the current configuration.
+    with a transient subclass, so the probe never mutates the shared engine
+    configuration (it can run while a translation is in progress).
+
+    ``provider_id`` may also be a verbatim engine name (e.g. ``ChatGPT``); in
+    that case ``endpoint`` is ignored.
 
     Nothing is persisted here: the caller owns the API key / model values.
     """
@@ -4715,25 +4719,32 @@ def test_model(provider_id: str, api_key: str, model: str, *,
     engine_name_str = engine_name(provider_id)
     started = time.time()
     helper = translator
-    restore: tuple[Any, Any] | None = None
     try:
         if helper is None:
-            engine_class = get_engine_class(engine_name_str)
-            original = dict(getattr(engine_class, "config", {}) or {})
-            probe_config = dict(original)
+            engine_class = next(
+                (engine for engine in builtin_engines
+                 if engine.name == engine_name_str), None)
+            if engine_class is None:
+                engine_class = get_engine_class(engine_name_str)
+            probe_config = dict(getattr(engine_class, "config", {}) or {})
             probe_config.update({
                 "api_keys": [api_key] if api_key else [],
                 "model": model,
+                # A probe is a single short request: no SSE parsing needed.
+                "stream": False,
                 "request_attempt": request_attempt,
                 "request_timeout": request_timeout,
             })
             if provider is not None:
                 probe_config.setdefault("provider", provider_id)
-                if provider.custom and provider.base_url:
-                    probe_config.setdefault("endpoint", provider.base_url)
-            engine_class.set_config(probe_config)
-            restore = (engine_class, original)
-            helper = engine_class()
+                if provider.custom:
+                    probe_config["endpoint"] = endpoint or provider.base_url
+            # A transient subclass keeps the probe thread-safe: the shared
+            # engine class keeps the configuration used by real translations.
+            probe_class = type(
+                f"Probe{engine_class.__name__}", (engine_class,),
+                {"config": probe_config, "model": model})
+            helper = probe_class()
         if hasattr(helper, "set_source_lang"):
             helper.set_source_lang(source_lang)
         if hasattr(helper, "set_target_lang"):
@@ -4752,13 +4763,6 @@ def test_model(provider_id: str, api_key: str, model: str, *,
         message = str(exc) or exc.__class__.__name__
         return TestResult(ok=False, latency_ms=latency, message=message[:400],
                           error_kind=_classify(message))
-    finally:
-        if restore is not None:
-            engine_class, original = restore
-            try:
-                engine_class.set_config(original)
-            except Exception:  # noqa: BLE001 - best effort
-                pass
 
 
 # The headless engine inlines this module into a single file, where the relative
@@ -7947,6 +7951,8 @@ __all__ = [
     "save_provider_models",
     "model_cache_age",
     "models_are_stale",
+    "save_model_test",
+    "model_test_status",
     "refresh_provider_models",
 ]
 
@@ -8009,6 +8015,9 @@ APP_DEFAULTS: dict[str, Any] = {
     # Live model lists fetched from the providers, keyed by provider id:
     # {"groq": {"at": <epoch>, "models": [...]}}.
     "model_cache": {},
+    # Last live model test per engine (desktop-only):
+    # {"Groq": {"at": <epoch>, "ok": true, "model": "...", "error": ""}}.
+    "model_tests": {},
 }
 
 #: Preference keys surfaced by the GUI for the selected engine.
@@ -8282,6 +8291,31 @@ def models_are_stale(provider_id: str) -> bool:
     """True when the cached model list is absent or older than the TTL."""
     age = model_cache_age(provider_id)
     return age is None or age > MODEL_CACHE_TTL
+
+
+def save_model_test(engine_name: str, *, ok: bool, model: str = "",
+                    error: str = "") -> None:
+    """Remember the outcome of the last live probe for ``engine_name``."""
+    if not engine_name:
+        return
+    config = get_config()
+    tests = dict(config.get("model_tests") or {})
+    tests[engine_name] = {"at": int(time.time()), "ok": bool(ok),
+                          "model": str(model or ""),
+                          "error": str(error or "")[:400]}
+    config.set("model_tests", tests)
+    config.commit()
+
+
+def model_test_status(engine_name: str, model: str | None = None) -> dict[str, Any]:
+    """Last probe for ``engine_name`` (``{}`` when absent or for another model)."""
+    tests = get_config().get("model_tests") or {}
+    entry = dict(tests.get(engine_name) or {})
+    if not entry:
+        return {}
+    if model is not None and str(entry.get("model") or "") != str(model or ""):
+        return {}
+    return entry
 
 
 def refresh_provider_models(provider_id: str, api_key: str = "", *,
