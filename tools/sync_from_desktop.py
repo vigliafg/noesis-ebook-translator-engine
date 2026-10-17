@@ -51,7 +51,9 @@ CORE_MODULES = [
     "engines/microsoft.py",
     "engines/deepseek.py",
     "engines/openrouter.py",
+    "engines/openai_compatible.py",
     "engines/custom.py",
+    "provider_catalog.py",
     "engines/__init__.py",
     "lib/element.py",
     "lib/handler.py",
@@ -67,8 +69,10 @@ CORE_MODULES = [
 
 #: Files that are part of the verbatim core (used for the provenance manifest and
 #: the parity test). ``engines/__init__.py`` is an intentional local override and
-#: is therefore excluded.
-VERBATIM = [m for m in CORE_MODULES if m != "engines/__init__.py"]
+#: the extensions are local files that do not exist in the Calibre plugin fork.
+EXTENSIONS = ["engines/openai_compatible.py", "provider_catalog.py"]
+VERBATIM = [m for m in CORE_MODULES
+            if m != "engines/__init__.py" and m not in EXTENSIONS]
 OVERRIDES = ["engines/__init__.py"]
 
 #: Matches the first line of an import statement we must drop when inlining:
@@ -118,9 +122,11 @@ import traceback
 import uuid
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
 from glob import glob
 from http.client import IncompleteRead
+from pathlib import Path
 from subprocess import PIPE, Popen
 from types import GeneratorType, ModuleType
 from typing import Any, Callable, Generator, Iterable
@@ -451,6 +457,7 @@ def main(argv=None) -> int:
         "synced_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
         "verbatim": VERBATIM,
         "overrides": OVERRIDES,
+        "extensions": EXTENSIONS,
         "frontend": "tools/frontend.py",
         "fixtures": FIXTURE_DIRS,
     }

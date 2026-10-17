@@ -37,9 +37,11 @@ import traceback
 import uuid
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
 from glob import glob
 from http.client import IncompleteRead
+from pathlib import Path
 from subprocess import PIPE, Popen
 from types import GeneratorType, ModuleType
 from typing import Any, Callable, Generator, Iterable
@@ -3942,6 +3944,172 @@ class OpenRouterTranslate(ChatgptTranslate):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  engines/openai_compatible.py
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+"""OpenAI-compatible provider engines (Noesis local extension).
+
+This file is a **local extension** of the verbatim Calibre-plugin engine: it
+adds a single generic transport for the curated providers listed in
+:mod:`noesis_ebook_translator.provider_catalog`, which all speak the OpenAI
+``/chat/completions`` protocol. One engine class is generated per provider, so
+each one keeps its own API key and model in ``engine_preferences`` (the existing
+per-engine configuration), and the engine registry stays unchanged otherwise.
+
+It is registered from the one intentionally non-verbatim file,
+``engines/__init__.py`` (see ``ENGINE_SOURCE.json``). The headless engine repo
+inlines this module too: keep it free of desktop-only imports at module level.
+"""
+
+import json
+from typing import Any
+
+
+
+load_translations()  # type: ignore
+
+
+def _chat_url(base: str) -> str:
+    """Normalise a user/provider base URL into a chat-completions endpoint."""
+    base = (base or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if base.endswith("/chat/completions"):
+        return base
+    return f"{base}/chat/completions"
+
+
+class OpenAICompatibleTranslate(ChatgptTranslate):
+    """Generic OpenAI-compatible translator.
+
+    Subclasses (built by :func:`engine_class_for`) set :attr:`provider`.
+    """
+
+    provider: Provider | None = None
+    provider_id: str = ""
+
+    def __init__(self):
+        super().__init__()
+        provider = self.provider
+        configured = (self.config.get("endpoint") or "").strip()
+        if configured:
+            self.endpoint = _chat_url(configured)
+        elif provider is not None and provider.base_url:
+            self.endpoint = provider.chat_url
+
+        models_url = (self.config.get("models_url") or "").strip()
+        if not models_url and provider is not None and provider.base_url:
+            models_url = provider.resolved_models_url
+        if not models_url and self.endpoint:
+            models_url = self.endpoint.rsplit("/chat/completions", 1)[0] + "/models"
+        self.models_endpoint = models_url
+
+    # ------------------------------------------------------------- requests
+    def get_headers(self) -> dict[str, str]:
+        headers = super().get_headers()
+        provider = self.provider
+        if provider is not None:
+            headers.update(dict(provider.extra_headers))
+        return headers
+
+    def get_models(self) -> list[str]:
+        """Live model list for this provider (falls back to the snapshot)."""
+        try:
+            return fetch_models(self.provider_id, self.api_key or "",
+                                timeout=self.request_timeout)
+        except Exception:  # noqa: BLE001 - the UI handles the fallback
+            return default_models(self.provider_id)
+
+    # -------------------------------------------------------------- batching
+    def translate_batch(self, segments: list[str]) -> list[str] | None:
+        """ID-indexed JSON batching, like the OpenRouter engine."""
+        if not segments:
+            return []
+        to_translate = {str(index): segment
+                        for index, segment in enumerate(segments)}
+        system_prompt = self.get_prompt() + (
+            "\n\nCRITICAL: Return a JSON object where each key corresponds to the "
+            "input ID and the value is the translated string. Return ONLY the "
+            'JSON object. Example: {"0": "translation 1", "1": "translation 2"}')
+        data: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(
+                    to_translate, ensure_ascii=False)},
+            ],
+            "stream": False,
+        }
+        was_streaming = self.stream
+        self.stream = False
+        try:
+            response = request(
+                self.endpoint, json.dumps(data), self.get_headers(), "POST",
+                timeout=int(self.request_timeout),
+                proxy_uri=self.proxy_uri)
+            text = self.get_result(response)
+        finally:
+            self.stream = was_streaming
+        if not text:
+            return None
+        clean = text.strip()
+        if "```json" in clean:
+            clean = clean.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean:
+            clean = clean.split("```")[1].split("```")[0].strip()
+        else:
+            start, end = clean.find("{"), clean.rfind("}")
+            if start != -1 and end != -1:
+                clean = clean[start:end + 1]
+        try:
+            translated: dict[str, Any] = json.loads(clean)
+        except (ValueError, TypeError):
+            return None
+        return [str(translated.get(str(index), "")).strip()
+                for index in range(len(segments))]
+
+
+def _class_name(provider: Provider) -> str:
+    parts = "".join(ch if ch.isalnum() else " " for ch in provider.id)
+    return "".join(word.capitalize() for word in parts.split()) + "Translate"
+
+
+def engine_class_for(provider: Provider) -> type[OpenAICompatibleTranslate]:
+    """Build the engine class that backs ``provider``."""
+    return type(_class_name(provider), (OpenAICompatibleTranslate,), {
+        "provider": provider,
+        "provider_id": provider.id,
+        "name": provider.name,
+        "alias": provider.name,
+        "endpoint": provider.chat_url if provider.base_url else None,
+        "models": [],
+        "model": provider.default_model or None,
+        "api_key_hint": _("{} API Key").format(provider.name)
+        if provider.name else _("API Keys"),
+        "free": False,
+    })
+
+
+def provider_engines() -> tuple[type[OpenAICompatibleTranslate], ...]:
+    """Engine classes for every curated provider not already builtin.
+
+    ``OpenRouter`` is skipped: the verbatim plugin engine of the same name is
+    already registered and used as-is.
+    """
+    return tuple(engine_class_for(provider) for provider in PROVIDERS
+                 if not provider.builtin)
+
+
+def engine_class(provider_id: str) -> type[OpenAICompatibleTranslate] | None:
+    """Engine class for ``provider_id`` (``None`` when not a curated provider)."""
+    for engine in provider_engines():
+        if engine.provider_id == provider_id:
+            return engine
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  engines/custom.py
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -4091,6 +4259,477 @@ class CustomTranslate(Base):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  provider_catalog.py
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+"""Curated catalogue of OpenAI-compatible translation providers.
+
+This module is **desktop-only** (it is not inlined into the headless engine
+repository). It complements the verbatim plugin engines with a small, curated
+set of modern providers that speak the OpenAI chat-completions protocol.
+
+Design notes
+------------
+* The provider list is **fixed and curated** (no runtime catalogue download):
+  every entry carries its base URL, authentication style, documentation URL and
+  a sensible default model.
+* Model lists are **live**: :func:`fetch_models` queries the provider's
+  ``/models`` endpoint (some are public, e.g. OpenCode/OpenRouter; the others
+  need the user's API key). :func:`default_models` returns the **bundled
+  snapshot** used as an offline fallback.
+* Nothing here performs network I/O at import time, and the HTTP client and
+  probes are injectable so the test-suite stays fully offline.
+"""
+
+import json
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from types import GeneratorType
+from typing import Any, Callable
+
+__all__ = [
+    "Provider",
+    "PROVIDERS",
+    "providers",
+    "get",
+    "engine_name",
+    "base_url",
+    "models_url",
+    "needs_api_key",
+    "default_models",
+    "fetch_models",
+    "test_model",
+    "TestResult",
+    "catalog_path",
+]
+
+#: User-Agent sent to provider endpoints (OpenCode Go asks clients to identify
+#: themselves with a non-generic agent string).
+USER_AGENT = "NoesisEbookTranslator/1.0"
+
+#: Where the bundled model snapshot lives (regenerated by
+#: ``tools/fetch_provider_catalog.py``).
+_DATA_FILE = Path(__file__).resolve().parent / "data" / "providers.json"
+
+
+@dataclass(frozen=True)
+class Provider:
+    """One curated, OpenAI-compatible translation provider."""
+
+    id: str
+    name: str
+    base_url: str = ""
+    models_url: str = ""
+    #: "bearer" | "x-api-key" | "query" | "none"
+    auth: str = "bearer"
+    env_hint: str = ""
+    doc: str = ""
+    default_model: str = ""
+    #: Engine display name. Defaults to :attr:`name`; "OpenRouter" reuses the
+    #: verbatim plugin engine of the same name.
+    engine_name: str = ""
+    #: True when the engine already exists among the verbatim builtins.
+    builtin: bool = False
+    #: True for the user-supplied base URL / key slot (Ollama, LM Studio, …).
+    custom: bool = False
+    #: i18n key for a UI notice (e.g. OpenCode Go's terms of use).
+    note: str = ""
+    extra_headers: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def resolved_engine_name(self) -> str:
+        return self.engine_name or self.name
+
+    @property
+    def chat_url(self) -> str:
+        base = (self.base_url or "").rstrip("/")
+        return f"{base}/chat/completions"
+
+    @property
+    def resolved_models_url(self) -> str:
+        if self.models_url:
+            return self.models_url
+        base = (self.base_url or "").rstrip("/")
+        return f"{base}/models"
+
+
+#: The curated provider roster. Kept intentionally short: registered as engines
+#: in ``engines/__init__.py`` and pitched as the "up to 4 configured providers"
+#: in the UI.
+PROVIDERS: tuple[Provider, ...] = (
+    Provider(
+        id="opencode", name="OpenCode",
+        base_url="https://opencode.ai/inference/openai/v1",
+        models_url="https://opencode.ai/inference/v1/models",
+        env_hint="OPENCODE_API_KEY",
+        doc="https://opencode.ai/v2/docs/console/models/",
+        default_model="",
+    ),
+    Provider(
+        id="opencode-go", name="OpenCode Go",
+        base_url="https://opencode.ai/inference/go/openai/v1",
+        models_url="https://opencode.ai/inference/go/v1/models",
+        env_hint="OPENCODE_API_KEY",
+        doc="https://opencode.ai/v2/docs/console/go/",
+        default_model="deepseek-v4.1-flash",
+        note="provider.note.opencode_go",
+        extra_headers=(("x-opencode-session", "noesis-ebook-translator"),),
+    ),
+    Provider(
+        id="openrouter", name="OpenRouter",
+        base_url="https://openrouter.ai/api/v1",
+        models_url="https://openrouter.ai/api/v1/models",
+        env_hint="OPENROUTER_API_KEY",
+        doc="https://openrouter.ai/models",
+        default_model="deepseek/deepseek-chat",
+        engine_name="OpenRouter", builtin=True,
+    ),
+    Provider(
+        id="groq", name="Groq",
+        base_url="https://api.groq.com/openai/v1",
+        env_hint="GROQ_API_KEY",
+        doc="https://console.groq.com/docs/models",
+        default_model="llama-3.3-70b-versatile",
+    ),
+    Provider(
+        id="mistral", name="Mistral",
+        base_url="https://api.mistral.ai/v1",
+        env_hint="MISTRAL_API_KEY",
+        doc="https://docs.mistral.ai/getting-started/models/",
+        default_model="mistral-large-latest",
+    ),
+    Provider(
+        id="xai", name="xAI (Grok)",
+        base_url="https://api.x.ai/v1",
+        env_hint="XAI_API_KEY",
+        doc="https://docs.x.ai/docs/models",
+        default_model="grok-4",
+    ),
+    Provider(
+        id="together", name="Together",
+        base_url="https://api.together.xyz/v1",
+        env_hint="TOGETHER_API_KEY",
+        doc="https://docs.together.ai/docs/serverless-models",
+        default_model="",
+    ),
+    Provider(
+        id="fireworks", name="Fireworks",
+        base_url="https://api.fireworks.ai/inference/v1",
+        env_hint="FIREWORKS_API_KEY",
+        doc="https://fireworks.ai/docs/",
+        default_model="",
+    ),
+    Provider(
+        id="deepinfra", name="DeepInfra",
+        base_url="https://api.deepinfra.com/v1/openai",
+        env_hint="DEEPINFRA_API_KEY",
+        doc="https://deepinfra.com/models",
+        default_model="",
+    ),
+    Provider(
+        id="cerebras", name="Cerebras",
+        base_url="https://api.cerebras.ai/v1",
+        env_hint="CEREBRAS_API_KEY",
+        doc="https://inference-docs.cerebras.ai/models/overview",
+        default_model="llama-3.3-70b",
+    ),
+    Provider(
+        id="sambanova", name="SambaNova",
+        base_url="https://api.sambanova.ai/v1",
+        env_hint="SAMBANOVA_API_KEY",
+        doc="https://docs.sambanova.ai/cloud/docs/get-started/supported-models",
+        default_model="Meta-Llama-3.3-70B-Instruct",
+    ),
+    Provider(
+        id="nvidia", name="NVIDIA NIM",
+        base_url="https://integrate.api.nvidia.com/v1",
+        env_hint="NVIDIA_API_KEY",
+        doc="https://docs.api.nvidia.com/nim/",
+        default_model="",
+    ),
+    Provider(
+        id="moonshot", name="Moonshot (Kimi)",
+        base_url="https://api.moonshot.ai/v1",
+        env_hint="MOONSHOT_API_KEY",
+        doc="https://platform.moonshot.ai/docs/api/chat",
+        default_model="moonshot-v1-8k",
+    ),
+    Provider(
+        id="zai", name="Z.AI (GLM)",
+        base_url="https://api.z.ai/api/paas/v4",
+        env_hint="ZHIPU_API_KEY",
+        doc="https://docs.z.ai/guides/overview/pricing",
+        default_model="glm-4.5",
+    ),
+    Provider(
+        id="alibaba", name="Alibaba (DashScope)",
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        env_hint="DASHSCOPE_API_KEY",
+        doc="https://www.alibabacloud.com/help/en/model-studio/models",
+        default_model="qwen-plus",
+    ),
+    Provider(
+        id="novita", name="Novita",
+        base_url="https://api.novita.ai/openai",
+        env_hint="NOVITA_API_KEY",
+        doc="https://novita.ai/docs/guides/introduction",
+        default_model="",
+    ),
+    Provider(
+        id="huggingface", name="HuggingFace",
+        base_url="https://router.huggingface.co/v1",
+        env_hint="HF_TOKEN",
+        doc="https://huggingface.co/docs/inference-providers",
+        default_model="",
+    ),
+    Provider(
+        id="custom", name="Custom endpoint",
+        base_url="", auth="bearer", custom=True,
+        doc="", default_model="",
+    ),
+)
+
+_BY_ID: dict[str, Provider] = {p.id: p for p in PROVIDERS}
+
+
+def providers() -> list[Provider]:
+    """All curated providers, in display order."""
+    return list(PROVIDERS)
+
+
+def get(provider_id: str | None) -> Provider | None:
+    """Look up a provider by its id (``None`` when unknown)."""
+    if not provider_id:
+        return None
+    return _BY_ID.get(provider_id)
+
+
+def engine_name(provider_id: str) -> str:
+    """Display name of the engine backing ``provider_id``."""
+    provider = get(provider_id)
+    return provider.resolved_engine_name if provider else provider_id
+
+
+def base_url(provider_id: str) -> str:
+    provider = get(provider_id)
+    return provider.base_url if provider else ""
+
+
+def models_url(provider_id: str) -> str:
+    provider = get(provider_id)
+    return provider.resolved_models_url if provider else ""
+
+
+def needs_api_key(provider_id: str) -> bool:
+    provider = get(provider_id)
+    return bool(provider and not provider.custom)
+
+
+def catalog_path() -> Path:
+    """Path of the bundled model snapshot."""
+    return _DATA_FILE
+
+
+def _load_snapshot() -> dict[str, Any]:
+    try:
+        return json.loads(_DATA_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def default_models(provider_id: str) -> list[str]:
+    """Bundled (offline) model list for ``provider_id``."""
+    snapshot = (_load_snapshot().get("models") or {}).get(provider_id) or []
+    return [str(model) for model in snapshot]
+
+
+# --------------------------------------------------------------------- HTTP
+
+
+def _default_request(url: str, **kwargs):
+    return request(url, **kwargs)
+
+
+def _headers_for(provider: Provider, api_key: str) -> dict[str, str]:
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    if provider.auth == "bearer" and api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif provider.auth == "x-api-key" and api_key:
+        headers["x-api-key"] = api_key
+    headers.update(dict(provider.extra_headers))
+    return headers
+
+
+def parse_models(payload: Any) -> list[str]:
+    """Extract model ids from an OpenAI-style (or Gemini-style) payload."""
+    if isinstance(payload, (str, bytes)):
+        payload = json.loads(payload)
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if data is None:
+            data = payload.get("models") or []
+    else:
+        data = payload or []
+    ids: list[str] = []
+    for item in data:
+        value: str | None = None
+        if isinstance(item, str):
+            value = item
+        elif isinstance(item, dict):
+            for key in ("id", "name", "model"):
+                if item.get(key):
+                    value = str(item[key])
+                    break
+        if not value:
+            continue
+        # Gemini reports "models/gemini-…".
+        value = value.split("/")[-1] if value.startswith("models/") else value
+        if value not in ids:
+            ids.append(value)
+    return ids
+
+
+def fetch_models(provider_id: str, api_key: str = "", *,
+                 _request: Callable[..., Any] | None = None,
+                 timeout: float = 15.0) -> list[str]:
+    """Query the provider's live model list.
+
+    ``_request`` is injectable for tests; the default uses the engine's own
+    :func:`lib.utils.request` (so the app proxy settings apply).
+    """
+    provider = get(provider_id)
+    if provider is None:
+        raise ValueError(f"unknown provider: {provider_id}")
+    url = provider.resolved_models_url
+    if not url or provider.custom:
+        return default_models(provider_id)
+    if provider.auth == "query" and api_key:
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}key={api_key}"
+    request = _request or _default_request
+    payload = request(url, headers=_headers_for(provider, api_key),
+                      method="GET", timeout=timeout)
+    models = parse_models(payload)
+    if not models:
+        raise ValueError("empty model list")
+    return models
+
+
+# ----------------------------------------------------------------- model test
+
+
+@dataclass
+class TestResult:
+    """Outcome of a live probe of one provider + model + key."""
+
+    ok: bool
+    latency_ms: int = 0
+    message: str = ""
+    error_kind: str = ""      # "" | auth | model | timeout | network | empty
+    sample: str = ""
+
+    def __bool__(self) -> bool:  # pragma: no cover - convenience
+        return self.ok
+
+
+def _classify(error_text: str) -> str:
+    lowered = error_text.lower()
+    if any(token in lowered for token in
+           ("401", "403", "unauthorized", "invalid api key", "invalid_api_key",
+            "authentication", "permission denied")):
+        return "auth"
+    if any(token in lowered for token in
+           ("404", "not found", "does not exist", "no such model",
+            "model_not_found", "unsupported model")):
+        return "model"
+    if "timeout" in lowered or "timed out" in lowered or "timed out" in lowered:
+        return "timeout"
+    return "network"
+
+
+PROBE_TEXT = "Hello"
+
+
+def test_model(provider_id: str, api_key: str, model: str, *,
+               translator: Any = None,
+               source_lang: str = "English", target_lang: str = "Italian",
+               request_attempt: int = 1, request_timeout: float = 15.0,
+               text: str = PROBE_TEXT) -> TestResult:
+    """Prove that ``model`` really translates with the given key.
+
+    Performs a **single short translation** (one attempt, short timeout) — the
+    only honest check that a model works for this app. ``translator`` may be
+    injected (tests); otherwise the engine registered for the provider is built
+    from the current configuration.
+
+    Nothing is persisted here: the caller owns the API key / model values.
+    """
+    if not model:
+        return TestResult(ok=False, error_kind="model", message="no model")
+    provider = get(provider_id)
+    if provider is not None and not provider.custom and not api_key:
+        return TestResult(ok=False, error_kind="auth", message="no api key")
+
+    engine_name_str = engine_name(provider_id)
+    started = time.time()
+    helper = translator
+    restore: tuple[Any, Any] | None = None
+    try:
+        if helper is None:
+            engine_class = get_engine_class(engine_name_str)
+            original = dict(getattr(engine_class, "config", {}) or {})
+            probe_config = dict(original)
+            probe_config.update({
+                "api_keys": [api_key] if api_key else [],
+                "model": model,
+                "request_attempt": request_attempt,
+                "request_timeout": request_timeout,
+            })
+            if provider is not None:
+                probe_config.setdefault("provider", provider_id)
+                if provider.custom and provider.base_url:
+                    probe_config.setdefault("endpoint", provider.base_url)
+            engine_class.set_config(probe_config)
+            restore = (engine_class, original)
+            helper = engine_class()
+        if hasattr(helper, "set_source_lang"):
+            helper.set_source_lang(source_lang)
+        if hasattr(helper, "set_target_lang"):
+            helper.set_target_lang(target_lang)
+        result = helper.translate(text)
+        if isinstance(result, GeneratorType):
+            result = "".join(result)
+        sample = (result or "").strip()
+        latency = int((time.time() - started) * 1000)
+        if not sample:
+            return TestResult(ok=False, latency_ms=latency, error_kind="empty",
+                              message="empty translation")
+        return TestResult(ok=True, latency_ms=latency, sample=sample[:120])
+    except Exception as exc:  # noqa: BLE001 - reported to the UI
+        latency = int((time.time() - started) * 1000)
+        message = str(exc) or exc.__class__.__name__
+        return TestResult(ok=False, latency_ms=latency, message=message[:400],
+                          error_kind=_classify(message))
+    finally:
+        if restore is not None:
+            engine_class, original = restore
+            try:
+                engine_class.set_config(original)
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+
+
+# The headless engine inlines this module into a single file, where the relative
+# import used elsewhere (``from . import provider_catalog``) is stripped by the
+# sync script. Aliasing the module to its own name keeps ``provider_catalog.x``
+# working in both the package and the single-file engine.
+provider_catalog = sys.modules[__name__]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  engines/__init__.py
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -4098,14 +4737,16 @@ class CustomTranslate(Base):
 # NOTE (Noesis override): the upstream plugin registers the full engine set here;
 # the fork this app is based on had dropped the ChatGPT/Azure/Gemini/Claude
 # entries. This project wants *all* plugin engines available, so they are
-# restored. This is the only engine file that is intentionally not verbatim.
+# restored. It also appends the curated OpenAI-compatible providers (OpenCode,
+# OpenCode Go, Groq, Mistral, …) generated in ``openai_compatible.py``. This file
+# is the only engine file that is intentionally not verbatim.
 builtin_engines: tuple[type[Base], ...] = (
     GoogleFreeTranslateNew, GoogleFreeTranslateHtml, GoogleFreeTranslate,
     GoogleBasicTranslate, GoogleBasicTranslateADC, GoogleAdvancedTranslate,
     GeminiTranslate, ChatgptTranslate, ClaudeTranslate, AzureChatgptTranslate,
     DeepseekTranslate, OpenRouterTranslate, DeeplTranslate, DeeplProTranslate,
     DeeplFreeTranslate, MicrosoftEdgeTranslate, YoudaoTranslate,
-    BaiduTranslate)
+    BaiduTranslate) + provider_engines()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -7242,19 +7883,37 @@ Noesis wants (single-language output, no metadata translation, …) and exposes 
 small, Qt-free API to read/write settings and to introspect the engines.
 """
 
+import time
 from typing import Any
 
 
 __all__ = [
     "APP_DEFAULTS",
+    "MAX_PROVIDER_SLOTS",
+    "MODEL_CACHE_TTL",
     "ensure_defaults",
     "load_settings",
     "save_settings",
     "engine_names",
+    "builtin_engine_names",
+    "legacy_engine_names",
     "engine_info",
     "set_engine_preference",
     "get_engine_preference",
+    "provider_choices",
+    "provider_slots",
+    "set_provider_slots",
+    "provider_id_for_engine",
+    "provider_models",
+    "save_provider_models",
+    "refresh_provider_models",
 ]
+
+#: Maximum number of providers the user can configure at the same time.
+MAX_PROVIDER_SLOTS = 4
+
+#: How long a live model list is trusted before a refresh is suggested.
+MODEL_CACHE_TTL = 24 * 3600
 
 
 #: App-level defaults written into the config on first run. Keys match
@@ -7302,11 +7961,19 @@ APP_DEFAULTS: dict[str, Any] = {
     # The engine also reserves img/code/br/hr/sub/sup/kbd/abbr/wbr/var/canvas/
     # svg/script/style/math by default. Add more via the `reserve_rules` setting.
     "reserve_rules": ["a"],
+    # Provider slots (desktop-only): up to MAX_PROVIDER_SLOTS configured
+    # providers, each with its own API key / model. Mirrored into
+    # ``engine_preferences`` under the engine name (see set_provider_slots).
+    "provider_slots": [],
+    # Live model lists fetched from the providers, keyed by provider id:
+    # {"groq": {"at": <epoch>, "models": [...]}}.
+    "model_cache": {},
 }
 
 #: Preference keys surfaced by the GUI for the selected engine.
 _ENGINE_PREFERENCE_KEYS = (
-    "api_keys", "model", "prompt", "target_lang", "concurrency_limit")
+    "api_keys", "model", "prompt", "target_lang", "concurrency_limit",
+    "endpoint", "models_url")
 
 
 def ensure_defaults() -> None:
@@ -7329,6 +7996,14 @@ def ensure_defaults() -> None:
     if config.get("ui_theme") == "sepia":
         config.set("ui_theme", "light")
         changed = True
+    # One-time migration: seed the provider slots from the single-engine
+    # configuration that predates multi-provider support.
+    if not config.preferences.get("provider_slots_v1"):
+        slots = _slots_from_engine_preferences()
+        if slots:
+            config.set("provider_slots", slots)
+        config.set("provider_slots_v1", True)
+        changed = True
     if changed:
         config.commit()
 
@@ -7346,9 +8021,74 @@ def save_settings(values: dict[str, Any]) -> None:
     config.commit()
 
 
+#: Engine names generated for the curated providers (``openai_compatible``).
+def _provider_engine_names() -> set[str]:
+    return {engine.name for engine in provider_engines()}
+
+
+#: Engine name -> provider id, for every curated provider (builtin included).
+def _provider_id_by_engine() -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for provider in provider_catalog.providers():
+        mapping[provider.resolved_engine_name] = provider.id
+    return mapping
+
+
+def provider_choices() -> list[dict[str, Any]]:
+    """Curated providers, ready for the provider pickers in the UI."""
+    return [{
+        "id": provider.id,
+        "name": provider.name,
+        "need_api_key": not provider.custom,
+        "default_model": provider.default_model,
+        "doc": provider.doc,
+        "env_hint": provider.env_hint,
+        "note": provider.note,
+        "custom": provider.custom,
+    } for provider in provider_catalog.providers()]
+
+
+def provider_id_for_engine(name: str) -> str:
+    """Provider id backed by engine ``name`` (``""`` when not a provider)."""
+    return _provider_id_by_engine().get(name or "", "")
+
+
 def engine_names() -> list[str]:
-    """All available engine display names."""
-    return [e.name for e in builtin_engines if e.name]
+    """Engine display names offered to the user.
+
+    The verbatim plugin engines are always listed; the curated provider engines
+    only appear once the user has enabled them in a slot (the settings page uses
+    :func:`provider_choices` for the full roster). This keeps the wizard and the
+    ribbon short while still offering any provider.
+    """
+    provider_engines = _provider_engine_names()
+    names = [e.name for e in builtin_engines
+             if e.name and e.name not in provider_engines]
+    for slot in provider_slots():
+        if not slot.get("enabled") or not slot.get("provider"):
+            continue
+        name = provider_catalog.engine_name(slot["provider"])
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def builtin_engine_names() -> list[str]:
+    """The verbatim plugin engines only (no curated provider engines)."""
+    provider_engines = _provider_engine_names()
+    return [e.name for e in builtin_engines
+            if e.name and e.name not in provider_engines]
+
+
+def legacy_engine_names() -> list[str]:
+    """Engines edited in the *Translation* page of the settings.
+
+    The curated providers (OpenRouter included) are owned by the Provider page,
+    so they are excluded here to avoid two pages writing the same preference.
+    """
+    curated = set(_provider_id_by_engine())
+    return [e.name for e in builtin_engines
+            if e.name and e.name not in curated]
 
 
 def engine_info(name: str) -> dict[str, Any]:
@@ -7356,14 +8096,158 @@ def engine_info(name: str) -> dict[str, Any]:
     engine = next((e for e in builtin_engines if e.name == name), None)
     if engine is None:
         return {"name": name, "need_api_key": True, "api_key_hint": "API Keys",
-                "models": None, "free": False}
+                "models": None, "free": False, "provider": "", "note": ""}
+    provider_id = getattr(engine, "provider_id", "") or ""
+    provider = provider_catalog.get(provider_id)
+    models = (provider_models(provider_id) if provider_id
+              else list(getattr(engine, "models", []) or []) or None)
     return {
         "name": engine.name,
-        "need_api_key": bool(engine.need_api_key),
+        "need_api_key": bool(getattr(engine, "need_api_key", True)),
         "api_key_hint": getattr(engine, "api_key_hint", "API Keys"),
-        "models": list(getattr(engine, "models", []) or []) or None,
+        "models": models,
         "free": bool(getattr(engine, "free", False)),
+        "provider": provider_id,
+        "note": provider.note if provider else "",
     }
+
+
+# ------------------------------------------------------------------ slots
+
+
+def _blank_slot() -> dict[str, Any]:
+    return {"enabled": False, "provider": "", "api_key": "", "model": "",
+            "endpoint": ""}
+
+
+def provider_slots() -> list[dict[str, Any]]:
+    """The configured provider slots, always padded to ``MAX_PROVIDER_SLOTS``."""
+    stored = get_config().get("provider_slots") or []
+    slots: list[dict[str, Any]] = []
+    for item in stored:
+        if not isinstance(item, dict):
+            continue
+        slot = _blank_slot()
+        slot.update({key: item.get(key) for key in slot if key in item})
+        slots.append(slot)
+    while len(slots) < MAX_PROVIDER_SLOTS:
+        slots.append(_blank_slot())
+    return slots[:MAX_PROVIDER_SLOTS]
+
+
+def set_provider_slots(slots: list[dict[str, Any]]) -> None:
+    """Persist the slots and mirror each one into ``engine_preferences``.
+
+    The engine layer only ever reads ``engine_preferences``, so this keeps the
+    translation path untouched.
+    """
+    config = get_config()
+    normalized: list[dict[str, Any]] = []
+    for item in (slots or [])[:MAX_PROVIDER_SLOTS]:
+        slot = _blank_slot()
+        if isinstance(item, dict):
+            slot.update({key: item.get(key) for key in slot if key in item})
+        slot["enabled"] = bool(slot["enabled"]) and bool(slot["provider"])
+        slot["api_key"] = str(slot.get("api_key") or "")
+        slot["model"] = str(slot.get("model") or "")
+        slot["endpoint"] = str(slot.get("endpoint") or "")
+        normalized.append(slot)
+    config.set("provider_slots", normalized)
+    config.commit()
+    for slot in normalized:
+        provider_id = slot.get("provider")
+        if not provider_id:
+            continue
+        name = provider_catalog.engine_name(provider_id)
+        if slot["enabled"]:
+            set_engine_preference(
+                name,
+                api_keys=[slot["api_key"]] if slot["api_key"] else [],
+                model=slot["model"] or None,
+                endpoint=slot["endpoint"] or None)
+        else:
+            # Keep the slot data (the user can re-enable it) but drop the
+            # mirrored engine config so a disabled provider is really inactive.
+            set_engine_preference(
+                name, api_keys=[], model=None, endpoint=None)
+
+
+def _slots_from_engine_preferences() -> list[dict[str, Any]]:
+    """Seed the slots from a pre-multi-provider configuration."""
+    config = get_config()
+    preferences = config.get("engine_preferences") or {}
+    by_engine = _provider_id_by_engine()
+    seeds: list[dict[str, Any]] = []
+    current = config.get("translate_engine")
+    order = ([current] if current in by_engine else []) + [
+        name for name in by_engine if name != current]
+    for name in order:
+        if len(seeds) >= MAX_PROVIDER_SLOTS:
+            break
+        pref = preferences.get(name) or {}
+        keys = pref.get("api_keys") or []
+        if not keys and name != current:
+            continue
+        slots = provider_slots()
+        slot = dict(slots[len(seeds)])
+        slot.update({
+            "enabled": bool(keys),
+            "provider": by_engine[name],
+            "api_key": (keys[0] if keys else ""),
+            "model": pref.get("model", "") or "",
+            "endpoint": pref.get("endpoint", "") or "",
+        })
+        seeds.append(slot)
+    return seeds
+
+
+# ------------------------------------------------------------ model lists
+
+
+def provider_models(provider_id: str) -> list[str] | None:
+    """Cached / bundled models for ``provider_id`` (``None`` when unknown)."""
+    if not provider_id:
+        return None
+    cache = get_config().get("model_cache") or {}
+    entry = cache.get(provider_id) or {}
+    models = [str(m) for m in (entry.get("models") or [])]
+    if models:
+        return models
+    snapshot = provider_catalog.default_models(provider_id)
+    return snapshot or None
+
+
+def save_provider_models(provider_id: str, models: list[str]) -> None:
+    """Cache a freshly fetched model list for ``provider_id``."""
+    if not provider_id or not models:
+        return
+    config = get_config()
+    cache = dict(config.get("model_cache") or {})
+    cache[provider_id] = {"at": int(time.time()),
+                          "models": [str(m) for m in models]}
+    config.set("model_cache", cache)
+    config.commit()
+
+
+def model_cache_age(provider_id: str) -> float | None:
+    """Seconds since the cached list was fetched (``None`` when absent)."""
+    cache = get_config().get("model_cache") or {}
+    entry = cache.get(provider_id) or {}
+    at = entry.get("at")
+    return None if at is None else max(0.0, time.time() - float(at))
+
+
+def refresh_provider_models(provider_id: str, api_key: str = "", *,
+                            _fetch=None) -> list[str]:
+    """Fetch the live model list and cache it.
+
+    ``_fetch`` is injectable so the GUI (and its tests) can avoid the network.
+    """
+    fetcher = _fetch or provider_catalog.fetch_models
+    models = fetcher(provider_id, api_key)
+    if models:
+        save_provider_models(provider_id, models)
+    return models or []
 
 
 def get_engine_preference(engine_name: str) -> dict[str, Any]:

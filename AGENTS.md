@@ -19,7 +19,9 @@ persa al successivo sync. Lo script:
 1. legge i moduli del motore dal desktop
    (`noesis_ebook_translator/lib/`, `.../engines/*.py`, `.../appconfig.py`,
    `.../book.py`), copiati verbatim dal fork **GPLv3** del plugin Calibre
-   `bookfere/Ebook-Translator-Calibre-Plugin`;
+   `bookfere/Ebook-Translator-Calibre-Plugin`, più le **estensioni locali**
+   condivise `engines/openai_compatible.py` e `provider_catalog.py` (trasporto
+   generico OpenAI-compatible + catalogo provider curati: non esistono nel fork);
 2. li **inlinea** in un unico file, rimuovendo gli import da `calibre` e gli
    import relativi (`from .` / `from ..`);
 3. appende il **front-end CLI/TUI** da `tools/frontend.py` (questo sì scritto a
@@ -51,8 +53,9 @@ python tools/sync_from_desktop.py --desktop /percorso/noesis-ebook-translator
 ## Provenienza e contratto di parità
 
 `ENGINE_SOURCE.json` registra il **commit desktop** di provenienza
-(`desktop_commit`), l'elenco dei moduli **verbatim** e l'**override** locale
-(`engines/__init__.py`), oltre al percorso del front-end (`tools/frontend.py`).
+(`desktop_commit`), l'elenco dei moduli **verbatim**, l'**override** locale
+(`engines/__init__.py`) e le **estensioni** locali (`extensions`), oltre al
+percorso del front-end (`tools/frontend.py`).
 
 Lo script copia anche il **corpus di test** dal desktop
 (`tests/data/corpus/`, `fixtures` in `ENGINE_SOURCE.json`): le fixture reali
