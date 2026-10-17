@@ -37,7 +37,10 @@ class TestCli(unittest.TestCase):
     def test_default_output_path(self):
         self.assertTrue(
             self.engine.default_output_path("/x/Book.epub", "Italian")
-            .endswith("_ITALIAN.epub"))
+            .endswith("Book-italian.epub"))
+        self.assertTrue(
+            self.engine.default_output_path("/x/Book.epub", "Chinese (Simplified)")
+            .endswith("Book-chinese-simplified.epub"))
 
     def test_cli_position_below_is_bilingual(self):
         rc = self.engine.main(
