@@ -4380,6 +4380,9 @@ __all__ = [
     "test_model",
     "TestResult",
     "catalog_path",
+    "models_dev_id",
+    "snapshot_generated_at",
+    "price",
 ]
 
 #: User-Agent sent to provider endpoints (OpenCode Go asks clients to identify
@@ -4614,11 +4617,49 @@ def catalog_path() -> Path:
     return _DATA_FILE
 
 
+#: Curated provider id -> models.dev provider id (they differ in a few cases).
+MODELS_DEV_IDS: dict[str, str] = {
+    "together": "togetherai",
+    "fireworks": "fireworks-ai",
+    "moonshot": "moonshotai",
+    "novita": "novita-ai",
+}
+
+
+def models_dev_id(provider_id: str) -> str:
+    """models.dev id for a curated provider id (identity when it matches)."""
+    return MODELS_DEV_IDS.get(provider_id, provider_id)
+
+
 def _load_snapshot() -> dict[str, Any]:
     try:
         return json.loads(_DATA_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+def snapshot_generated_at() -> str:
+    """When the bundled snapshot (models and prices) was generated."""
+    return str(_load_snapshot().get("generated_at") or "")
+
+
+def price(provider_id: str, model: str) -> tuple[float, float] | None:
+    """``(input, output)`` USD per 1M tokens, or ``None`` when unknown.
+
+    ``provider_id`` may be a curated provider id (``"groq"``) or a models.dev id
+    (``"openai"``): builtin engines such as ChatGPT/Claude/Gemini use the latter.
+    A model that is missing from the snapshot (or whose price is free) is
+    reported honestly: ``None`` means "we don't know", ``(0.0, 0.0)`` means free.
+    """
+    if not model:
+        return None
+    costs = (_load_snapshot().get("cost") or {})
+    entry = costs.get(models_dev_id(provider_id)) or {}
+    value = entry.get(model) or {}
+    try:
+        return (float(value["input"]), float(value["output"]))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def route_for(provider_id: str, model: str) -> str:
@@ -6660,7 +6701,8 @@ XHTML = "{http://www.w3.org/1999/xhtml}"
 
 __all__ = [
     "Chapter", "load_chapters", "flatten", "resolve_selection",
-    "chapter_files", "book_meta", "isolate_chapters", "ChapterError",
+    "chapter_files", "book_meta", "isolate_chapters", "toc_anchors",
+    "ChapterError",
 ]
 
 
@@ -6878,6 +6920,11 @@ def _toc_anchor_map(book) -> dict[str, set[str]]:
 
     walk(book.toc)
     return anchors
+
+
+def toc_anchors(book) -> dict[str, set[str]]:
+    """Public alias of the TOC anchor map (``{file: {anchor, ...}}``)."""
+    return _toc_anchor_map(book)
 
 
 def isolate_chapters(book, selected) -> None:
@@ -8026,6 +8073,7 @@ __all__ = [
     "builtin_engine_names",
     "legacy_engine_names",
     "engine_info",
+    "engine_supports_prompt",
     "set_engine_preference",
     "get_engine_preference",
     "provider_choices",
@@ -8059,6 +8107,9 @@ APP_DEFAULTS: dict[str, Any] = {
     # per-chapter progress view truthful: a single chapter is "in progress".
     # Slower with engines that would otherwise run many requests in parallel.
     "translate_sequential": True,
+    # Requests sent in parallel when "sequential" is off (1-8). Feeds both the
+    # engine's concurrency_limit and the wizard's duration estimate.
+    "translate_parallel": 4,
     "filter_scope": "text",
     "rule_mode": "normal",
     "ebook_metadata": {"metadata_translation": False},
@@ -8188,6 +8239,24 @@ def provider_id_for_engine(name: str) -> str:
     return _provider_id_by_engine().get(name or "", "")
 
 
+def _builtin_engines() -> tuple:
+    """The engine registry **now**.
+
+    ``register_fake_engine()`` (and any runtime registration) rebinds
+    ``engines.builtin_engines`` to a new tuple; a module-level import of the
+    original tuple would keep the stale one and hide the injected engine from
+    the wizard. Resolved by name at call time; the headless monofile inlines the
+    engines into the same namespace, where the global is already the live one.
+    """
+    try:
+        import importlib
+
+        return importlib.import_module(
+            "noesis_ebook_translator.engines").builtin_engines
+    except Exception:  # noqa: BLE001 - inlined engine: same module namespace
+        return globals()["builtin_engines"]
+
+
 def engine_names() -> list[str]:
     """Engine display names offered to the user.
 
@@ -8197,7 +8266,7 @@ def engine_names() -> list[str]:
     ribbon short while still offering any provider.
     """
     provider_engines = _provider_engine_names()
-    names = [e.name for e in builtin_engines
+    names = [e.name for e in _builtin_engines()
              if e.name and e.name not in provider_engines]
     for slot in provider_slots():
         if not slot.get("enabled") or not slot.get("provider"):
@@ -8211,7 +8280,7 @@ def engine_names() -> list[str]:
 def builtin_engine_names() -> list[str]:
     """The verbatim plugin engines only (no curated provider engines)."""
     provider_engines = _provider_engine_names()
-    return [e.name for e in builtin_engines
+    return [e.name for e in _builtin_engines()
             if e.name and e.name not in provider_engines]
 
 
@@ -8222,13 +8291,23 @@ def legacy_engine_names() -> list[str]:
     so they are excluded here to avoid two pages writing the same preference.
     """
     curated = set(_provider_id_by_engine())
-    return [e.name for e in builtin_engines
+    return [e.name for e in _builtin_engines()
             if e.name and e.name not in curated]
+
+
+def engine_supports_prompt(name: str) -> bool:
+    """True when the engine is an LLM (it has a system prompt to extend).
+
+    Plain machine-translation engines (DeepL, the free Google ones, Baidu…) have
+    no prompt: the genre analysis cannot say anything useful to them.
+    """
+    engine = next((e for e in _builtin_engines() if e.name == name), None)
+    return bool(engine is not None and hasattr(engine, "prompt"))
 
 
 def engine_info(name: str) -> dict[str, Any]:
     """Return UI-relevant metadata for the engine called ``name``."""
-    engine = next((e for e in builtin_engines if e.name == name), None)
+    engine = next((e for e in _builtin_engines() if e.name == name), None)
     if engine is None:
         return {"name": name, "need_api_key": True, "api_key_hint": "API Keys",
                 "models": None, "free": False, "provider": "", "note": ""}
@@ -8462,7 +8541,9 @@ Qt GUI (``main.py``) and the CLI/TUI edition both drive.
 import json
 import os
 import re
+import sqlite3
 import time
+from glob import glob
 from typing import Any, Callable, Iterable
 
 import ebooklib
@@ -8472,7 +8553,8 @@ from lxml import etree
 
 __all__ = [
     "translate_epub", "preview_translation", "list_engine_names",
-    "default_output_path", "output_name", "language_slug",
+    "default_output_path", "output_name", "output_base_name", "language_slug",
+    "interrupted_runs", "dismiss_interrupted_run", "collect_segments",
 ]
 
 
@@ -8591,6 +8673,20 @@ def output_name(name: str, target_lang: str) -> str:
     return f"{stem}-{language_slug(target_lang)}.epub"
 
 
+def output_base_name(output_path: str, target_lang: str) -> str:
+    """The inverse of :func:`output_name`: ``Dune-italian.epub`` -> ``Dune``.
+
+    Resuming a run must target the *same* file that was being written, and the
+    wizard/``_start_translation`` append the language suffix themselves; passing
+    the full name back would produce ``Dune-italian-italian.epub``.
+    """
+    stem = os.path.splitext(os.path.basename(output_path or ""))[0]
+    suffix = "-" + language_slug(target_lang)
+    if stem.lower().endswith(suffix):
+        stem = stem[: -len(suffix)]
+    return stem or "book"
+
+
 def default_output_path(input_path: str, target_lang: str = "Italian") -> str:
     folder = os.path.dirname(input_path)
     stem = os.path.splitext(os.path.basename(input_path))[0]
@@ -8616,31 +8712,67 @@ def _apply_settings(settings: dict[str, Any] | None) -> None:
 # selection, so every finished translation is also stored in a content-keyed
 # table (same SQLite file): the source text is the only stable identity.
 #
-# The table is scoped by engine + model + source/target language, so switching
-# model can never mix translations (and switching back restores its own work).
+# The table is scoped by engine + model + source/target language **and style
+# prompt**, so switching any of them can never mix translations (and switching
+# back restores its own work).
 _RESUME_TABLE = "noesis_resume"
+#: Column added when the style prompt became part of a run's identity.
+_RESUME_STYLE_COLUMN = "style_hash"
 
 
 def _resume_content_hash(content: str) -> str:
     return uid(content or "")
 
 
-def _resume_key(translator, source_lang: str, target_lang: str) -> tuple[str, ...]:
+def _style_hash(style_prompt: str | None) -> str:
+    """Stable identity of the style addendum (``""`` when there is none)."""
+    return uid(style_prompt or "")
+
+
+def _resume_key(translator, source_lang: str, target_lang: str,
+                style_hash: str = "") -> tuple[str, ...]:
     return (translator.name or "",
             str(getattr(translator, "model", "") or ""),
             source_lang or "",
-            target_lang or "")
+            target_lang or "",
+            style_hash or "")
 
 
-def _ensure_resume_table(cache) -> None:
+def _create_resume_table(cache) -> None:
     cache.cursor.execute(
         f"CREATE TABLE IF NOT EXISTS {_RESUME_TABLE}("
         "content_hash TEXT NOT NULL, engine_name TEXT NOT NULL, "
         "model TEXT NOT NULL, source_lang TEXT NOT NULL, "
-        "target_lang TEXT NOT NULL, original TEXT, translation TEXT, "
-        "updated_at INTEGER, "
+        "target_lang TEXT NOT NULL, style_hash TEXT NOT NULL DEFAULT '', "
+        "original TEXT, translation TEXT, updated_at INTEGER, "
         "PRIMARY KEY(content_hash, engine_name, model, source_lang, "
-        "target_lang))")
+        "target_lang, style_hash))")
+
+
+def _ensure_resume_table(cache) -> None:
+    """Create the resume table, migrating the pre-style version if needed.
+
+    The style prompt is part of the key, so the old table (without the column)
+    cannot simply gain one: SQLite cannot add a column to a primary key. The
+    work is carried over with ``style_hash=''``, which is exactly the scope of
+    runs translated without a style prompt — those keep resuming for free.
+    """
+    _create_resume_table(cache)
+    columns = [row[1] for row in cache.cursor.execute(
+        f"PRAGMA table_info({_RESUME_TABLE})").fetchall()]
+    if _RESUME_STYLE_COLUMN in columns:
+        cache.connection.commit()
+        return
+    legacy = f"{_RESUME_TABLE}_legacy"
+    cache.cursor.execute(f"DROP TABLE IF EXISTS {legacy}")
+    cache.cursor.execute(f"ALTER TABLE {_RESUME_TABLE} RENAME TO {legacy}")
+    _create_resume_table(cache)
+    cache.cursor.execute(
+        f"INSERT INTO {_RESUME_TABLE}(content_hash, engine_name, model, "
+        "source_lang, target_lang, style_hash, original, translation, "
+        "updated_at) SELECT content_hash, engine_name, model, source_lang, "
+        f"target_lang, '', original, translation, updated_at FROM {legacy}")
+    cache.cursor.execute(f"DROP TABLE {legacy}")
     cache.connection.commit()
 
 
@@ -8652,25 +8784,29 @@ def _remember_translation(cache, paragraph, resume_key) -> None:
     """
     if not paragraph.translation:
         return
-    engine, model, source, target = resume_key
+    engine, model, source, target, style_hash = resume_key
     cache.cursor.execute(
         f"INSERT INTO {_RESUME_TABLE}("
         "content_hash, engine_name, model, source_lang, target_lang, "
-        "original, translation, updated_at) VALUES(?,?,?,?,?,?,?,?) "
+        "style_hash, original, translation, updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(content_hash, engine_name, model, source_lang, "
-        "target_lang) DO UPDATE SET translation=excluded.translation, "
-        "original=excluded.original, updated_at=excluded.updated_at",
+        "target_lang, style_hash) DO UPDATE SET "
+        "translation=excluded.translation, original=excluded.original, "
+        "updated_at=excluded.updated_at",
         (_resume_content_hash(paragraph.original), engine, model, source,
-         target, paragraph.original, paragraph.translation, int(time.time())))
+         target, style_hash, paragraph.original, paragraph.translation,
+         int(time.time())))
 
 
 def _seed_resume_translations(cache, originals, resume_key) -> int:
     """Restore known translations for this run's segments (by content)."""
-    engine, model, source, target = resume_key
+    engine, model, source, target, style_hash = resume_key
     rows = cache.cursor.execute(
         f"SELECT content_hash, translation FROM {_RESUME_TABLE} "
-        "WHERE engine_name=? AND model=? AND source_lang=? AND target_lang=?",
-        (engine, model, source, target)).fetchall()
+        "WHERE engine_name=? AND model=? AND source_lang=? AND target_lang=? "
+        "AND style_hash=?",
+        (engine, model, source, target, style_hash)).fetchall()
     known = {content_hash: translation for content_hash, translation in rows
              if translation}
     if not known:
@@ -8703,8 +8839,286 @@ def _cache_progress(cache) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
+#  Run marker: does the *app* know a translation was interrupted?
+# ---------------------------------------------------------------------------
+# The engine resumes by itself, but only when the same translation is started
+# again: after a power cut nothing told the user that hours of work were waiting.
+# Every run writes its state into the cache's ``info`` table:
+#
+#   running    the marker set at the start; a *crash* (power cut, SIGKILL,
+#              segfault) leaves it behind, because nothing runs after the
+#              process is gone -- that is its signature.
+#   finished   the EPUB was written (and renamed) safely.
+#   cancelled  the user stopped the run on purpose (no prompt).
+#   dismissed  the user declined to resume: stop asking for this run.
+#
+# An ordinary engine failure keeps ``running`` too: a long run that dies on a
+# network error deserves the same "your work is here" notice. Declining once
+# writes ``dismissed``, so it never nags twice.
+_RUN_RUNNING = "running"
+_RUN_FINISHED = "finished"
+_RUN_CANCELLED = "cancelled"
+_RUN_DISMISSED = "dismissed"
+
+
+def _mark_running(cache, input_path: str, output_path: str,
+                  config, *, style_prompt: str = "",
+                  genre: str = "", concurrency: int = 0) -> None:
+    """Record the run so an abrupt death can be discovered and resumed."""
+    options = {
+        "translation_position": config.get("translation_position") or "only",
+        "cache_enabled": bool(config.get("cache_enabled")),
+        "online_batching": bool(config.get("online_batching")),
+        "sequential": bool(config.get("translate_sequential", True)),
+        "concurrency": int(concurrency or 0),
+        "style_prompt": style_prompt or "",
+        "genre": genre or "",
+        "style_hash": _style_hash(style_prompt),
+    }
+    cache.set_info("input_path", os.path.abspath(input_path))
+    cache.set_info("output_path", os.path.abspath(output_path))
+    cache.set_info("run_options", json.dumps(options))
+    cache.set_info("run_status", _RUN_RUNNING)
+    cache.set_info("run_updated_at", str(int(time.time())))
+    cache.set_info("run_started_at", str(int(time.time())))
+    cache.set_info("run_style_hash", _style_hash(style_prompt))
+
+
+def _mark_status(cache, status: str) -> None:
+    """Finish the run marker (the cache may already be closed)."""
+    try:
+        cache.set_info("run_status", status)
+        cache.set_info("run_updated_at", str(int(time.time())))
+    except sqlite3.Error:  # pragma: no cover - a non-persistent cache is gone
+        pass
+
+
+def _mark_finished(cache, *, engine_calls: int, segments: int,
+                   concurrency: int, batching: bool) -> None:
+    """Close the marker **and** record the throughput of this run.
+
+    The estimate uses these numbers to replace its default latency with the
+    measured one: after one real run, "how long will this take?" is grounded in
+    what the provider actually did, not in a constant.
+    """
+    _mark_status(cache, _RUN_FINISHED)
+    try:
+        cache.set_info("run_finished_at", str(int(time.time())))
+        cache.set_info("run_engine_calls", str(int(engine_calls)))
+        cache.set_info("run_segments", str(int(segments)))
+        cache.set_info("run_concurrency", str(int(concurrency)))
+        cache.set_info("run_batching", "1" if batching else "0")
+    except sqlite3.Error:  # pragma: no cover - non-persistent cache
+        pass
+
+
+def _read_cache_state(db_path: str) -> tuple[dict[str, str], int, int]:
+    """Read a cache file without disturbing it: ``(info, done, total)``.
+
+    Opened read-only: a discovery pass must never create a directory, migrate a
+    file or write a byte -- and it may run while another process holds the same
+    database.
+    """
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:  # pragma: no cover - unreadable file
+        return {}, 0, 0
+    try:
+        rows = connection.execute("SELECT key, value FROM info").fetchall()
+        info = {str(key): value for key, value in rows}
+        progress = connection.execute(
+            "SELECT COUNT(*), "
+            "(SELECT COUNT(*) FROM cache WHERE NOT ignored) "
+            "FROM cache WHERE NOT ignored AND translation IS NOT NULL AND "
+            "translation<>''").fetchone()
+        done, total = (int(progress[0]), int(progress[1])) if progress else (0, 0)
+    except sqlite3.Error:
+        return {}, 0, 0
+    finally:
+        connection.close()
+    return info, done, total
+
+
+def _json_or_none(value: Any) -> Any:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def interrupted_runs(input_path: str | None = None, *,
+                     directory: str | None = None) -> list[dict[str, Any]]:
+    """Translations that were still in progress when their process died.
+
+    Scans the translation-cache directory (milliseconds: it only opens the
+    ``info`` table of each ``*.db``) and returns the runs whose marker is still
+    ``running``, newest first. Pass ``input_path`` to see only one book.
+
+    ``directory`` defaults to the live cache path (``TranslationCache.cache_path``);
+    tests use it to point at a private store.
+    """
+    store = directory if directory is not None else TranslationCache.cache_path
+    if not os.path.isdir(store):
+        return []
+    wanted = os.path.abspath(input_path) if input_path else None
+    found: list[dict[str, Any]] = []
+    for db_path in glob(os.path.join(store, "*.db")):
+        info, done, total = _read_cache_state(db_path)
+        if info.get("run_status") != _RUN_RUNNING:
+            continue
+        stored = info.get("input_path") or ""
+        if wanted and os.path.abspath(stored) != wanted:
+            continue
+        if total < 1:
+            continue                       # nothing was ever prepared
+        updated_at = info.get("run_updated_at") or ""
+        try:
+            updated = int(updated_at)
+        except (TypeError, ValueError):
+            try:
+                updated = int(os.path.getmtime(db_path))
+            except OSError:  # pragma: no cover - vanished in the meantime
+                updated = 0
+        options = _json_or_none(info.get("run_options")) or {}
+        found.append({
+            "cache_path": db_path,
+            "title": info.get("title") or os.path.basename(stored or db_path),
+            "input_path": stored,
+            "output_path": info.get("output_path") or "",
+            "engine": info.get("engine_name") or "",
+            "model": info.get("model") or "",
+            "source_lang": info.get("source_lang") or "",
+            "target_lang": info.get("target_lang") or "",
+            "chapters": _json_or_none(info.get("chapters")),
+            "options": options,
+            "style_prompt": options.get("style_prompt") or "",
+            "genre": options.get("genre") or "",
+            "done": done,
+            "total": total,
+            "updated_at": updated,
+        })
+    found.sort(key=lambda run: (run["updated_at"], run["cache_path"]),
+               reverse=True)
+    return found
+
+
+def dismiss_interrupted_run(run: dict[str, Any] | str) -> None:
+    """Stop offering ``run`` again (the user answered "No").
+
+    Best effort by design: a cache that cannot be written (or that vanished) must
+    not make opening a book fail.
+    """
+    path = run.get("cache_path") if isinstance(run, dict) else str(run)
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        connection = sqlite3.connect(path)
+    except sqlite3.Error:  # pragma: no cover - unreadable file
+        return
+    try:
+        connection.execute(
+            "INSERT INTO info VALUES (?, ?) ON CONFLICT(key) DO UPDATE "
+            "SET value=excluded.value", ("run_status", _RUN_DISMISSED))
+        connection.commit()
+    except sqlite3.Error:  # pragma: no cover - unexpected schema
+        pass
+    finally:
+        connection.close()
+
+
+# ---------------------------------------------------------------------------
 #  The pipeline
 # ---------------------------------------------------------------------------
+def _segment_anchors(book, pages, elements) -> dict[int, str]:
+    """Map each prepared element to the TOC anchor that owns it.
+
+    ``isolate_chapters`` already trims a shared XHTML document to the selected
+    ``[anchor, next_anchor)`` ranges, so the same "last anchor before this node"
+    rule gives the chapter a segment belongs to -- which is what the estimate
+    needs to report tokens **per chapter** even when two entries share a file.
+    """
+    anchors_by_file = toc_anchors(book)
+    roots = {page.href: page.data for page in pages
+             if getattr(page, "data", None) is not None}
+    positions: dict[str, tuple[dict, list]] = {}
+    for file_name, root in roots.items():
+        try:
+            order = {node: index for index, node in enumerate(root.iter())}
+        except Exception:  # noqa: BLE001 - defensive: a broken page gets no anchors
+            continue
+        wanted = anchors_by_file.get(file_name) or set()
+        found: dict[str, int] = {}
+        for node in root.iter():
+            identifier = node.get("id")
+            if identifier and identifier in wanted and identifier not in found:
+                found[identifier] = order.get(node, 0)
+        positions[file_name] = (order, sorted(found.items(), key=lambda p: p[1]))
+
+    result: dict[int, str] = {}
+    for oid, element in enumerate(elements):
+        page_id = getattr(element, "page_id", None)
+        node = getattr(element, "element", None)
+        if not page_id or page_id == "toc.ncx" or page_id not in positions:
+            continue
+        order, ordered = positions[page_id]
+        position = order.get(node)
+        if position is None or not ordered:
+            continue
+        current = ""
+        for anchor, anchor_position in ordered:
+            if anchor_position <= position:
+                current = anchor
+            else:
+                break
+        result[oid] = current
+    return result
+
+
+def collect_segments(
+    input_path: str,
+    *,
+    chapters: Any = None,
+    direction: str = "auto",
+    engine: str | None = None,
+    source_lang: str = "English",
+    target_lang: str = "Italian",
+) -> list[dict[str, Any]]:
+    """The segments a run would translate, without translating anything.
+
+    Returns ``[{"page", "anchor", "text", "ignored"}]`` in engine order (TOC
+    titles first, page ``"toc.ncx"``). It prepares the elements exactly like
+    :func:`translate_epub`, so the token/price estimate counts the same text the
+    engine will be paid for. Nothing is written and no network call is made.
+    """
+    translator = get_translator(get_engine_class(engine))
+    translator.set_source_lang(source_lang)
+    translator.set_target_lang(target_lang)
+    book = epub.read_epub(input_path)
+    if chapters:
+        selected = resolve_selection(chapters_from_book(book), chapters)
+        restrict_book(book, chapter_files(selected))
+        isolate_chapters(book, selected)
+    pages = _parse_pages(book)
+    toc_nodes = _parse_toc(book.toc)
+    handler = get_element_handler(
+        translator.placeholder, translator.separator,
+        direction or get_config().get("target_direction") or "auto")
+    handler.set_translation_lang(translator.get_iso639_target_code(target_lang))
+    elements: list = []
+    elements.extend(get_toc_elements(toc_nodes, []))
+    elements.extend(get_page_elements(pages))
+    originals = handler.prepare_original(elements)
+    anchors = _segment_anchors(book, pages, elements)
+    return [{
+        "page": entry[6] or "",
+        "anchor": anchors.get(entry[0], ""),
+        "text": entry[3],
+        "ignored": bool(entry[4]),
+    } for entry in originals]
+
+
 def translate_epub(
     input_path: str,
     output_path: str | None = None,
@@ -8716,6 +9130,8 @@ def translate_epub(
     settings: dict[str, Any] | None = None,
     chapters: Any = None,
     cache_only: bool = False,
+    style_prompt: str | None = None,
+    genre: str = "",
     on_progress: Callable[[float, str], None] | None = None,
     on_log: Callable[[str, bool], None] | None = None,
     on_paragraph: Callable[[Any], None] | None = None,
@@ -8736,6 +9152,12 @@ def translate_epub(
     translator = get_translator(engine_class)
     translator.set_source_lang(source_lang)
     translator.set_target_lang(target_lang)
+    style_prompt = (style_prompt or "").strip()
+    if style_prompt and hasattr(translator, "prompt"):
+        # *Append* the genre/style addendum: the engine's own prompt already
+        # enforces completeness and placeholder handling, and replacing it would
+        # throw those guarantees away.
+        translator.prompt = f"{translator.prompt} {style_prompt}".strip()
 
     config = get_config()
     direction = direction or config.get("target_direction") or "auto"
@@ -8796,14 +9218,17 @@ def translate_epub(
     # Keep the run selection so "resume" can offer the same chapters again.
     cache.set_info("chapters",
                    json.dumps(chapters, default=str) if chapters else "")
-    # Never mix translations produced by another model / source language: keep
-    # the rows but drop their translations (the resume table keeps them per
-    # model, so switching back restores that model's work).
+    # Never mix translations produced by another model / source language / style
+    # prompt: keep the rows but drop their translations (the resume table keeps
+    # them per scope, so switching back restores that scope's work).
     model = str(getattr(translator, "model", "") or "")
+    style_hash = _style_hash(style_prompt)
     previous_model = cache.get_info("model") or ""
     previous_source = cache.get_info("source_lang") or ""
-    if previous_model and (previous_model != model
-                           or previous_source != (source_lang or "")):
+    previous_style = cache.get_info("run_style_hash") or ""
+    if ((previous_model and (previous_model != model
+                             or previous_source != (source_lang or "")))
+            or previous_style != style_hash):
         cache.cursor.execute(
             "UPDATE cache SET translation=NULL, engine_name=NULL, "
             "target_lang=NULL")
@@ -8811,12 +9236,22 @@ def translate_epub(
     cache.set_info("model", model)
     cache.set_info("source_lang", source_lang or "")
 
+    # From here on, an abrupt death of the process leaves ``running`` behind: the
+    # app can then tell the user that this translation was interrupted and offer
+    # to continue it (``interrupted_runs``).
+    _mark_running(cache, input_path, output_path, config,
+                  style_prompt=style_prompt, genre=genre,
+                  concurrency=int(getattr(translator, "concurrency_limit", 0) or 0))
+
     cache.save(originals)
     _ensure_cache_rows(cache, originals)
     _ensure_resume_table(cache)
-    resume_key = _resume_key(translator, source_lang, target_lang)
+    resume_key = _resume_key(translator, source_lang, target_lang, style_hash)
     _seed_resume_translations(cache, originals, resume_key)
     paragraphs = cache.all_paragraphs()
+    # How many calls this run will really make (used by the estimate's latency
+    # calibration): everything already translated is served from the cache.
+    engine_calls = sum(1 for paragraph in paragraphs if not paragraph.translation)
     if on_resume is not None:
         on_resume(*_cache_progress(cache))
 
@@ -8846,14 +9281,20 @@ def translate_epub(
             if paragraph.translation:
                 paragraph.is_cache = True
 
-    translation.handle(paragraphs)
+    try:
+        translation.handle(paragraphs)
+    except TranslationCanceled:
+        # The engine itself aborts on the cancel request: same meaning as the
+        # explicit check below, so the run must not be offered as "interrupted".
+        _mark_status(cache, _RUN_CANCELLED)
+        raise
     # A cancelled run returns normally from the engine's handler (it drains the
     # queue), so check explicitly: writing a half-translated EPUB and reporting
     # success is worse than stopping here.
     if should_cancel is not None and should_cancel():
+        _mark_status(cache, _RUN_CANCELLED)
         raise TranslationCanceled("Translation canceled.")
     handler.add_translations(paragraphs)
-    cache.done()
 
     for page in pages:
         page.write_back()
@@ -8875,6 +9316,14 @@ def translate_epub(
                 os.remove(part_path)
             except OSError:  # pragma: no cover - best effort
                 pass
+    # Only now is the run really over: until this marker changes, opening the
+    # book offers to continue it.
+    _mark_finished(
+        cache, engine_calls=engine_calls, segments=len(paragraphs),
+        concurrency=int(getattr(translator, "concurrency_limit", 0) or 0),
+        batching=bool(config.get("online_batching"))
+        and hasattr(translator, "translate_batch"))
+    cache.done()
     return output_path
 
 

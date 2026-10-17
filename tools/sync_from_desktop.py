@@ -83,6 +83,12 @@ _DROP_IMPORT = re.compile(r"^(from\s+(calibre|\.|__future__)|import\s+calibre\b)
 #: repository roots. Kept in sync so both editions test against the same corpus.
 FIXTURE_DIRS = ["tests/data/corpus"]
 
+#: Runtime data files of the inlined modules, relative to the desktop package.
+#: ``provider_catalog`` loads the bundled model/price snapshot from a path next
+#: to the generated module (``<repo>/data/providers.json``), so it must travel
+#: with the code or the CLI loses its offline model lists.
+DATA_FILES = ["data/providers.json"]
+
 HEADER = '''#!/usr/bin/env python3
 """Noesis Ebook Translator — Engine (CLI + TUI), single file.
 
@@ -437,6 +443,20 @@ def copy_fixtures(desktop: Path) -> int:
     return copied
 
 
+def copy_data_files(desktop: Path) -> int:
+    """Copy the runtime data of the inlined modules (best effort)."""
+    copied = 0
+    for rel in DATA_FILES:
+        src = desktop / PACKAGE / rel
+        if not src.is_file():
+            continue
+        target = ROOT / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+        copied += 1
+    return copied
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--desktop", type=Path, default=DEFAULT_DESKTOP,
@@ -450,6 +470,7 @@ def main(argv=None) -> int:
     OUTPUT.write_text(text, encoding="utf-8")
 
     fixtures = copy_fixtures(desktop)
+    data_files = copy_data_files(desktop)
 
     meta = {
         "desktop_repo": str(desktop),
@@ -460,6 +481,7 @@ def main(argv=None) -> int:
         "extensions": EXTENSIONS,
         "frontend": "tools/frontend.py",
         "fixtures": FIXTURE_DIRS,
+        "data": DATA_FILES,
     }
     (ROOT / "ENGINE_SOURCE.json").write_text(
         json.dumps(meta, indent=2) + "\n", encoding="utf-8")
@@ -467,6 +489,7 @@ def main(argv=None) -> int:
     print(f"wrote {OUTPUT.name}: {len(text.splitlines())} lines, "
           f"{len(CORE_MODULES)} modules + frontend")
     print(f"copied {fixtures} fixture files from {FIXTURE_DIRS}")
+    print(f"copied {data_files} data files from {DATA_FILES}")
     print(f"desktop commit: {meta['desktop_commit'] or '(unknown)'}")
     return 0
 
