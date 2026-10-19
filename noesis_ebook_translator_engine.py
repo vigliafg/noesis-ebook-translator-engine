@@ -1843,6 +1843,7 @@ defaults: dict[str, Any] = {
     'merge_length': 1800,
     'ebook_metadata': {},
     'online_batching': False,
+    'batch_size': 20,
     'search_paths': [],
 }
 
@@ -3096,6 +3097,29 @@ class ChatgptTranslate(GenAI):
                 else {'enabled': bool(self.reasoning)})
         return body
 
+    #: True while a batch request is being built (see ``apply_max_tokens``).
+    batch = False
+
+    #: Room for a JSON batch answer. The default chat budget is fine for one
+    #: segment, but a batch of 20 plus reasoning tokens hits it and the JSON
+    #: comes back truncated (``finish_reason == "length"``).
+    batch_max_tokens = 16384
+
+    def apply_max_tokens(self, body: dict, text: str) -> dict:
+        """Size the completion budget of a **batch** request.
+
+        A truncated reply is unrecoverable: the batch JSON loses its closing
+        brace and the whole request is retried. The budget follows the input
+        (translated text is roughly as long as the source, plus JSON syntax),
+        within ``batch_max_tokens``.
+        """
+        if not self.batch:
+            return body
+        budget = min(self.batch_max_tokens,
+                     max(4096, int(len(text) * 2.5) + 512))
+        body['max_tokens'] = max(int(body.get('max_tokens') or 0), budget)
+        return body
+
     def get_body(self, text):
         body: dict[str, Any] = {
             'model': self.model,
@@ -3109,6 +3133,7 @@ class ChatgptTranslate(GenAI):
         sampling_value = getattr(self, self.sampling)
         body.update({self.sampling: sampling_value})
         self.apply_reasoning(body)
+        self.apply_max_tokens(body, text)
         return json.dumps(body)
 
     def get_result(self, response):
@@ -3841,6 +3866,48 @@ class DeepseekTranslate(ChatgptTranslate):
 import json
 import os
 
+
+def _parse_json_object(text):
+    """Best-effort JSON object from a model reply.
+
+    Models wrap the object in prose or code fences, and a truncated reply loses
+    its closing brace. Strip the fences, cut to the outer braces, then repair a
+    missing tail (``{"0": "a", "1": "b"``) by closing the open string/brace so
+    the segments that *did* arrive are usable instead of losing the whole batch.
+    """
+    if not isinstance(text, str):
+        return None
+    clean = text.strip()
+    if "```json" in clean:
+        clean = clean.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in clean:
+        clean = clean.split("```", 1)[1].split("```", 1)[0].strip()
+    start = clean.find('{')
+    if start == -1:
+        return None
+    end = clean.rfind('}')
+    candidate = clean[start:end + 1] if end != -1 else clean[start:]
+    try:
+        return json.loads(candidate)
+    except ValueError:
+        pass
+    # Truncated reply: only the closing brace is missing -> just close it.
+    try:
+        return json.loads(candidate.rstrip().rstrip(',') + '}')
+    except ValueError:
+        pass
+    # Otherwise the last pair was cut mid-string: drop pairs from the end until
+    # what is left parses. A half-translated string must never be accepted.
+    cut = candidate.rstrip().rstrip('}')
+    comma = cut.rfind(',')
+    while comma != -1:
+        try:
+            return json.loads(cut[:comma] + '}')
+        except ValueError:
+            comma = cut.rfind(',', 0, comma)
+    return None
+
+
 class OpenRouterTranslate(ChatgptTranslate):
     name = 'OpenRouter'
     alias = 'OpenRouter'
@@ -3913,8 +3980,16 @@ class OpenRouterTranslate(ChatgptTranslate):
         data = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": 8192,
         }
+        # A batch needs room for every segment *and* the JSON syntax: the old
+        # fixed 8192 came back truncated (finish_reason "length") as soon as the
+        # model also reasoned, and then the whole JSON was unparseable.
+        self.batch = True
+        try:
+            self.apply_max_tokens(
+                data, json.dumps(to_translate, ensure_ascii=False))
+        finally:
+            self.batch = False
         self.apply_reasoning(data)
 
         # reasoning_effort for batch too
@@ -3948,20 +4023,10 @@ class OpenRouterTranslate(ChatgptTranslate):
                 
             # Parse the JSON from the model
             try:
-                # Robust extraction of JSON from model output
-                clean_json = result_text
-                if "```json" in clean_json:
-                    clean_json = clean_json.split("```json")[1].split("```")[0].strip()
-                elif "```" in clean_json:
-                    clean_json = clean_json.split("```")[1].split("```")[0].strip()
-                else:
-                    start_idx = clean_json.find('{')
-                    end_idx = clean_json.rfind('}')
-                    if start_idx != -1 and end_idx != -1:
-                        clean_json = clean_json[start_idx:end_idx+1]
-                
-                translated_data = json.loads(clean_json)
-                
+                translated_data = _parse_json_object(result_text)
+                if not isinstance(translated_data, dict):
+                    raise ValueError('reply is not a JSON object')
+
                 results = []
                 for i in range(len(segments)):
                     idx_str = str(i)
@@ -3969,7 +4034,7 @@ class OpenRouterTranslate(ChatgptTranslate):
                         results.append(str(translated_data[idx_str]).strip())
                     else:
                         # Fallback for missing ID in JSON
-                        results.append("") 
+                        results.append("")
                 
                 return results
             except Exception as e:
@@ -5971,9 +6036,11 @@ class Handler:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+import json
+import random
 import re
 import time
-import json
+from concurrent.futures import ThreadPoolExecutor
 from types import GeneratorType
 
 
@@ -6033,6 +6100,22 @@ class ProgressBar:
         self._count += 1
         self.length += self.step
         return self._count
+
+
+def _retry_delay(message, base):
+    """Backoff for a failed request.
+
+    ``Retry-After`` wins when the provider sends it; otherwise exponential
+    backoff plus jitter, so N parallel workers do not retry in lockstep.
+    """
+    match = re.search(r"retry[-_ ]after[\"':= ]+(\d+(?:\.\d+)?)", message,
+                      re.IGNORECASE)
+    if match:
+        try:
+            return max(0.0, float(match.group(1)))
+        except ValueError:
+            pass
+    return base + random.uniform(0, base * 0.3)
 
 
 class Translation:
@@ -6100,7 +6183,7 @@ class Translation:
             if retry >= self.translator.request_attempt:
                 raise TranslationFailed('{}\n{}'.format(message, str(e)))
             retry += 1
-            interval += 5
+            interval = _retry_delay(str(e), interval + 5)
             # Logging any errors that occur during translation.
             logged_text = text[:200] + '...' if len(text) > 200 else text
             error_messages = [
@@ -6172,73 +6255,157 @@ class Translation:
                 message = _('Translation (Cached): {}')
             self.log(message.format(paragraph.translation.strip()))
             
+    def _request_batch(self, texts):
+        """Translate one batch, retrying only the segments that came back empty.
+
+        ``translate_batch`` returns one entry per input, with ``''`` where the
+        model dropped an id (a truncated or malformed JSON). Re-sending the whole
+        batch would pay again for the segments that already arrived, so each
+        retry carries only the missing ones. Returns a list aligned with
+        ``texts``; empty entries mean "still missing" and the caller reports
+        them per segment instead of failing the whole run.
+
+        The model's reasoning is switched off for the request: it is billed as
+        output, and inside a batch it eats the completion budget until the JSON
+        is truncated (measured: 4 of 6 replies with ``finish_reason=length``).
+        The engine restores its own setting afterwards.
+        """
+        results = [''] * len(texts)
+        pending = list(range(len(texts)))
+        attempts = max(1, int(self.translator.request_attempt))
+        attempt = 0
+        interval = 5
+        while pending and attempt < attempts:
+            if self.cancel_request():
+                raise TranslationCanceled(_('Translation canceled.'))
+            payload = [texts[index] for index in pending]
+            try:
+                reply = self.translator.translate_batch(payload)
+            except Exception as e:  # noqa: BLE001 - retried below
+                attempt += 1
+                self.log(_('Batch failed ({}): {}').format(attempt, str(e)), True)
+                if attempt >= attempts:
+                    raise TranslationFailed(
+                        _('Batch translation failed after {} attempts')
+                        .format(attempt))
+                time.sleep(interval)
+                interval = _retry_delay(str(e), interval + 5)
+                continue
+            if not reply:
+                attempt += 1
+                if attempt >= attempts:
+                    break
+                time.sleep(interval)
+                interval = _retry_delay('', interval + 5)
+                continue
+            for slot, value in zip(pending, reply):
+                if value and str(value).strip():
+                    results[slot] = str(value).strip()
+            missing = [index for index in pending if not results[index]]
+            if missing:
+                attempt += 1
+                if attempt < attempts:
+                    self.log(_('Batch returned {} of {} segments, retrying the rest')
+                             .format(len(pending) - len(missing), len(pending)), True)
+                pending = missing
+            else:
+                pending = []
+        return results
+
     def handle_batch(self, paragraphs=[]):
         start_time = time.time()
         char_count = sum(len(p.original) for p in paragraphs)
-        
+
         self.log(sep())
         self.log(_('Start to translate ebook content (Online Batching)'))
         self.log(sep('┈'))
         self.log(_('Item count: {}').format(len(paragraphs)))
         self.log(_('Character count: {}').format(char_count))
-        
+
         if len(paragraphs) < 1:
             raise Exception(_('There is no content need to translate.'))
-            
+
         self.progress_bar.load(len(paragraphs))
-        
-        # Determine batch size (default 20 for OpenRouter)
-        batch_size = 20
-        
-        for i in range(0, len(paragraphs), batch_size):
-            if self.cancel_request():
-                raise TranslationCanceled(_('Translation canceled.'))
-                
-            batch = paragraphs[i:i + batch_size]
-            # Only translate untranslated paragraphs unless fresh is True
-            to_translate = [p for p in batch if not p.translation or self.fresh]
-            
-            if to_translate:
-                self.log(sep())
-                self.log(_('Translating batch starting at row {} ({} items)...').format(batch[0].row if batch[0].row >= 0 else i, len(to_translate)))
-                
-                # Perform batch translation with retries
-                results = None
-                retry = 0
-                interval = 5
-                while retry < self.translator.request_attempt:
-                    if self.cancel_request():
-                        raise TranslationCanceled(_('Translation canceled.'))
-                    
-                    try:
-                        results = self.translator.translate_batch([p.original for p in to_translate])
-                        if results and len(results) == len(to_translate):
-                            break
-                        else:
-                            raise Exception("Incomplete batch result")
-                    except Exception as e:
-                        retry += 1
-                        self.log(_('Batch failed ({}): {}').format(retry, str(e)), True)
-                        if retry >= self.translator.request_attempt:
-                            raise TranslationFailed(_('Batch translation failed after {} attempts').format(retry))
-                        time.sleep(interval)
-                        interval += 5
-                
-                # Apply results
-                if results:
-                    for p, trans in zip(to_translate, results):
-                        p.translation = trans
-                        p.is_cache = False
-                        p.engine_name = self.translator.name
-                        p.target_lang = self.translator.get_target_lang()
-                        if self.translator.merge_enabled:
-                            p.do_aligment(self.translator.separator)
-            
-            # Process results for UI
-            for p in batch:
-                self.process_translation(p)
+
+        config = get_config()
+        batch_size = max(1, int(config.get('batch_size') or 20))
+        # Batches are independent requests: run several at once. The batching
+        # path used to ignore concurrency_limit entirely and issued one request
+        # at a time (5x slower than the per-segment path in the speed test).
+        workers = max(1, int(self.translator.concurrency_limit or 1))
+
+        # Reasoning and batching do not mix: the model spends the batch's
+        # completion budget thinking and the JSON comes back truncated
+        # (measured: 4 of 6 replies with finish_reason=length). One switch for
+        # the whole phase, not per request, so a concurrent batch never races
+        # with the restore.
+        reasoning = getattr(self.translator, 'reasoning', None)
+        if getattr(self.translator, 'reasoning_supported', False):
+            self.translator.reasoning = {'enabled': False}
+
+        batches = [paragraphs[index:index + batch_size]
+                   for index in range(0, len(paragraphs), batch_size)]
+
+        try:
+            for start in range(0, len(batches), workers):
                 if self.cancel_request():
                     raise TranslationCanceled(_('Translation canceled.'))
+                window = batches[start:start + workers]
+                pending = []   # [(batch, to_translate)] in submission order
+                for batch in window:
+                    to_translate = [p for p in batch
+                                    if not p.translation or self.fresh]
+                    if to_translate:
+                        self.log(sep())
+                        self.log(_('Translating batch starting at row {} ({} items)...')
+                                 .format(batch[0].row if batch[0].row >= 0 else 0,
+                                         len(to_translate)))
+                        pending.append((batch, to_translate))
+
+                if pending:
+                    with ThreadPoolExecutor(
+                            max_workers=min(workers, len(pending))) as pool:
+                        futures = [
+                            pool.submit(
+                                self._request_batch,
+                                [self.glossary.replace(p.original)
+                                 for p in to_translate])
+                            for _, to_translate in pending]
+                        results = [future.result() for future in futures]
+
+                    for (batch, to_translate), translations in zip(pending,
+                                                                   results):
+                        for paragraph, translation in zip(to_translate,
+                                                          translations):
+                            if not translation:
+                                # Keep the source text and surface the segment
+                                # as an error, like a failed per-segment call.
+                                paragraph.error = _(
+                                    'Batch translation incomplete.')
+                                continue
+                            paragraph.translation = self.glossary.restore(
+                                translation)
+                            paragraph.is_cache = False
+                            paragraph.engine_name = self.translator.name
+                            paragraph.target_lang = \
+                                self.translator.get_target_lang()
+                            if self.translator.merge_enabled:
+                                paragraph.do_aligment(
+                                    self.translator.separator)
+
+                # Process results for UI, in reading order, on this thread: the
+                # persistence callback writes to the shared SQLite cache.
+                for batch in window:
+                    for paragraph in batch:
+                        self.process_translation(paragraph)
+                        if self.cancel_request():
+                            raise TranslationCanceled(
+                                _('Translation canceled.'))
+                if self.translator.request_interval:
+                    time.sleep(self.translator.request_interval)
+        finally:
+            if getattr(self.translator, 'reasoning_supported', False):
+                self.translator.reasoning = reasoning
 
         self.log(sep())
         consuming = round((time.time() - start_time) / 60, 2)
@@ -8180,6 +8347,7 @@ __all__ = [
     "legacy_engine_names",
     "engine_info",
     "engine_supports_prompt",
+    "engine_supports_reasoning",
     "set_engine_preference",
     "get_engine_preference",
     "provider_choices",
@@ -8207,15 +8375,19 @@ MODEL_CACHE_TTL = 24 * 3600
 APP_DEFAULTS: dict[str, Any] = {
     "translation_position": "only",   # translated text replaces the original
     "online_batching": False,
+    # Segments per online-batching request. 20 is the engine's long-standing
+    # value; fewer batches are cheaper but one truncated reply costs more.
+    "batch_size": 20,
     "merge_enabled": False,
     "cache_enabled": True,
-    # Translate one segment at a time (concurrency_limit = 1). Keeps the
-    # per-chapter progress view truthful: a single chapter is "in progress".
-    # Slower with engines that would otherwise run many requests in parallel.
-    "translate_sequential": True,
-    # Requests sent in parallel when "sequential" is off (1-8). Feeds both the
+    # Parallel by default: the speed test measured 856 s sequential vs 63 s at
+    # 20 concurrent requests on one chapter, and the per-chapter progress is
+    # still truthful (several chapters run at once, each with its own bar).
+    # Sequential remains one click away for rate-limited engines.
+    "translate_sequential": False,
+    # Requests sent in parallel when "sequential" is off. Feeds both the
     # engine's concurrency_limit and the wizard's duration estimate.
-    "translate_parallel": 4,
+    "translate_parallel": 8,
     # Sampler temperature override for LLM engines. ``None`` means "leave the
     # engine's own default" (DeepSeek ships 1.3, Gemini 0.9, the generic ones
     # 1.0). The low value that keeps short segments from drifting lives on
@@ -8480,6 +8652,16 @@ def engine_supports_prompt(name: str) -> bool:
     """
     engine = next((e for e in _builtin_engines() if e.name == name), None)
     return bool(engine is not None and hasattr(engine, "prompt"))
+
+
+def engine_supports_reasoning(name: str) -> bool:
+    """True when the engine accepts the provider's ``reasoning`` field.
+
+    Only those can be asked to skip the model's internal reasoning, and only
+    those can therefore hit the batch/reasoning conflict.
+    """
+    engine = next((e for e in _builtin_engines() if e.name == name), None)
+    return bool(getattr(engine, "reasoning_supported", False))
 
 
 def engine_info(name: str) -> dict[str, Any]:
@@ -8927,6 +9109,32 @@ def _apply_translation_defaults(translator) -> None:
         return
     translator.reasoning = ({"enabled": bool(reasoning)}
                             if isinstance(reasoning, bool) else reasoning)
+
+
+def _configure_translator(translator) -> None:
+    """Apply the run-level settings that live outside the engine preferences.
+
+    Two rules that the per-engine config cannot express, because they depend on
+    the *mode* of the run:
+
+    * parallel means "no artificial throttle": the OpenAI family defaults to
+      20 s between requests, which made the concurrency knob pointless (745 s
+      vs 112 s on a chapter). Sequential keeps the engine's own interval, which
+      is what protects the free/rate-limited services;
+    * batching needs a request budget that fits a whole batch (see
+      ``apply_max_tokens``); without it a reasoning model truncates the JSON.
+    """
+    config = get_config()
+    try:
+        concurrency = int(getattr(translator, "concurrency_limit", 0) or 0)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        concurrency = 0
+    engine_config = getattr(translator, "config", None) or {}
+    if concurrency > 1 and "request_interval" not in engine_config:
+        translator.request_interval = 0
+    if hasattr(translator, "batch_max_tokens"):
+        translator.batch = bool(config.get("online_batching")) and hasattr(
+            translator, "translate_batch")
 
 
 # ---------------------------------------------------------------------------
@@ -9380,6 +9588,7 @@ def translate_epub(
     translator.set_source_lang(source_lang)
     translator.set_target_lang(target_lang)
     _apply_translation_defaults(translator)
+    _configure_translator(translator)
     style_prompt = (style_prompt or "").strip()
     if style_prompt and hasattr(translator, "prompt"):
         # *Append* the genre/style addendum: the engine's own prompt already
@@ -9659,6 +9868,7 @@ def preview_translation(
     translator.set_source_lang(source_lang)
     translator.set_target_lang(target_lang)
     _apply_translation_defaults(translator)
+    _configure_translator(translator)
 
     book = epub.read_epub(input_path)
     preserve_document_markup(book)
