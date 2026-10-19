@@ -3827,14 +3827,18 @@ class OpenRouterTranslate(ChatgptTranslate):
     name = 'OpenRouter'
     alias = 'OpenRouter'
     endpoint = 'https://openrouter.ai/api/v1/chat/completions'
-    
-    # Specialized Italian literary translator prompt
-    prompt = (
-        "Sei un traduttore letterario esperto dall'inglese all'italiano, con profonda conoscenza della letteratura anglosassone. "
-        "Il tuo obiettivo è produrre traduzioni accurate, fluide e idiomatiche che preservino fedeltà semantica, stile e tono originale. "
-        "Usa un italiano colto ed elegante. Mantieni invariati paragrafi, dialoghi e capitoli. "
-        "Rispondi SOLO con la traduzione pura, senza introduzioni o spiegazioni."
-    )
+
+    # OpenRouter is a generic gateway with no vendor-tuned value; 1.0 made
+    # short, context-free segments drift (a chapter title "Stroke" came out as
+    # both "Ictus" and "Colpo"). Keep it low and let the genre addendum decide
+    # the style. Per-engine/user settings can still override it.
+    temperature = 0.2
+
+    # No persona of its own: the neutral prompt of ``ChatgptTranslate`` is the
+    # right default for any genre. The per-book specialisation comes from the
+    # app's genre analysis (style addendum appended by ``book.translate_epub``).
+    # A hard-coded *literary* prompt here made short segments of a medical
+    # textbook come out as "colpo" (blow) instead of "ictus" (stroke).
 
     models: list[str] = [
         'deepseek/deepseek-chat', 
@@ -5421,7 +5425,8 @@ class Extraction:
         'address', 'blockquote', 'dialog', 'div', 'figure', 'figcaption',
         'footer', 'header', 'legend', 'main', 'p', 'pre', 'search', 'article',
         'aside', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hgroup', 'nav',
-        'section', 'dd', 'dl', 'dt', 'menu', 'ol', 'ul', 'table', 'caption',
+        'section', 'dd', 'dl', 'dt', 'menu', 'ol', 'ul', 'li', 'table',
+        'caption',
         'colgroup', 'col', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th')
 
     def __init__(
@@ -6690,6 +6695,7 @@ selections such as ``"1,3,5-7"`` or a list of hrefs. Used by the desktop GUI
 
 import os
 import posixpath
+import types
 import zipfile
 from dataclasses import dataclass, field
 from xml.etree import ElementTree
@@ -6702,8 +6708,29 @@ XHTML = "{http://www.w3.org/1999/xhtml}"
 __all__ = [
     "Chapter", "load_chapters", "flatten", "resolve_selection",
     "chapter_files", "book_meta", "isolate_chapters", "toc_anchors",
-    "ChapterError",
+    "ChapterError", "preserve_document_markup",
 ]
+
+
+def preserve_document_markup(book) -> None:
+    """Keep each document's original ``<head>`` across an ebooklib round-trip.
+
+    :meth:`ebooklib.epub.EpubHtml.get_content` does not return the file it read:
+    it rebuilds it from ebooklib's own template and re-emits only the ``<head>``
+    entries registered on the item (``links``, ``metas``, ``title``).
+    :func:`ebooklib.epub.read_epub` registers none of them, so parsing or writing
+    a document silently drops every ``<link rel="stylesheet">``, its ``<meta>``
+    and its ``<title>`` -- the exported/translated book keeps the CSS *files* but
+    nothing links them, and the formatting is gone.
+
+    Call this right after ``read_epub``: it points the regular documents at the
+    bytes they were read from. The navigation document keeps ebooklib's
+    generator, since the TOC rewriting happens there.
+    """
+    for item in book.get_items():
+        if isinstance(item, epub.EpubHtml) and \
+                not isinstance(item, epub.EpubNav):
+            item.get_content = types.MethodType(epub.EpubItem.get_content, item)
 
 
 def _fragment_of(href: str | None) -> str | None:
@@ -6990,10 +7017,32 @@ def _trim_item_to_anchors(item, wanted: set[str], all_anchors: set[str]) -> None
                 break
         return current
 
+    def in_range(element) -> bool:
+        segment = segment_of(element)
+        return segment is not None and segment in wanted
+
+    # Keep every element inside a selected range *and its ancestors*: the TOC
+    # anchor often sits on a descendant (Elsevier chapters are a single
+    # ``<section><h1 id="...">`` wrapper), so deciding on the top-level child's
+    # own position alone deleted the whole wrapper -- and the chapter with it.
+    keep = set()
+    for element in body.iter():
+        if not isinstance(element.tag, str) or not in_range(element):
+            continue
+        keep.add(element)
+        ancestor = element.getparent()
+        while ancestor is not None and ancestor is not body:
+            keep.add(ancestor)
+            ancestor = ancestor.getparent()
+
     removed = False
+    for parent in reversed(list(body.iterdescendants())):
+        for child in list(parent):
+            if child not in keep:
+                parent.remove(child)
+                removed = True
     for child in list(body):
-        segment = segment_of(child)
-        if segment is None or segment not in wanted:
+        if child not in keep:
             body.remove(child)
             removed = True
     if removed:
@@ -7256,6 +7305,13 @@ def _parse(item):
         parser=etree.XMLParser(recover=True, resolve_entities=False))
 
 
+def _read(path: str):
+    """Read an EPUB with its documents' original ``<head>`` kept intact."""
+    book = epub.read_epub(path)
+    preserve_document_markup(book)
+    return book
+
+
 def _ordered_documents(book, files: set[str] | None):
     docs = []
     for entry in book.spine or []:
@@ -7364,7 +7420,7 @@ class Table:
 
 def extract_figures(epub_path: str, chapters: list[Chapter] | None = None,
                     selected: list[Chapter] | None = None) -> list[Figure]:
-    book = epub.read_epub(epub_path)
+    book = _read(epub_path)
     files = chapter_files(selected) if selected else None
     if selected:
         isolate_chapters(book, selected)
@@ -7390,7 +7446,7 @@ def extract_figures(epub_path: str, chapters: list[Chapter] | None = None,
 
 def extract_tables(epub_path: str, chapters: list[Chapter] | None = None,
                    selected: list[Chapter] | None = None) -> list[Table]:
-    book = epub.read_epub(epub_path)
+    book = _read(epub_path)
     files = chapter_files(selected) if selected else None
     if selected:
         isolate_chapters(book, selected)
@@ -7430,7 +7486,7 @@ def extract_tables(epub_path: str, chapters: list[Chapter] | None = None,
 def extract_text(epub_path: str, chapters: list[Chapter] | None = None,
                  selected: list[Chapter] | None = None) -> list[tuple[int, str, str]]:
     """Return ``[(chapter_index, chapter_name, segment_text), ...]``."""
-    book = epub.read_epub(epub_path)
+    book = _read(epub_path)
     files = chapter_files(selected) if selected else None
     if selected:
         isolate_chapters(book, selected)
@@ -7465,7 +7521,7 @@ class TextBlock:
 def extract_text_blocks(epub_path: str,
                         selected: list[Chapter] | None = None) -> list[TextBlock]:
     """Return every text block with a stable ``(file, order)`` locator."""
-    book = epub.read_epub(epub_path)
+    book = _read(epub_path)
     files = chapter_files(selected) if selected else None
     blocks: list[TextBlock] = []
     for doc in _ordered_documents(book, files):
@@ -7494,7 +7550,7 @@ def apply_text_edits(epub_path: str, output_path: str, edits) -> str:
     for file_name, order, text in edits:
         by_file.setdefault(file_name, {})[int(order)] = str(text)
 
-    book = epub.read_epub(epub_path)
+    book = _read(epub_path)
     for item in book.get_items():
         if item.get_type() != 9 or item.file_name not in by_file:
             continue
@@ -7530,7 +7586,7 @@ def apply_table_edits(epub_path: str, output_path: str, edits) -> str:
     for file_name, order, rows in edits:
         by_file.setdefault(file_name, {})[int(order)] = rows
 
-    book = epub.read_epub(epub_path)
+    book = _read(epub_path)
     for item in book.get_items():
         if item.get_type() != 9 or item.file_name not in by_file:
             continue
@@ -7572,7 +7628,7 @@ def _write_table(table, rows: list[list[str]]) -> None:
 def replace_image(epub_path: str, output_path: str, image_name: str,
                   data: bytes) -> str:
     """Replace the bytes of one image item; return the written EPUB path."""
-    book = epub.read_epub(epub_path)
+    book = _read(epub_path)
     replaced = False
     for item in book.get_items():
         if item.file_name == image_name and \
@@ -7697,7 +7753,9 @@ def restrict_book(book, files: set[str]) -> None:
 
 
 def _read(path: str):
-    return epub.read_epub(path)
+    book = epub.read_epub(path)
+    preserve_document_markup(book)
+    return book
 
 
 def _ensure_toc_uids(toc) -> None:
@@ -8070,6 +8128,7 @@ __all__ = [
     "load_settings",
     "save_settings",
     "engine_names",
+    "desktop_engine_names",
     "builtin_engine_names",
     "legacy_engine_names",
     "engine_info",
@@ -8110,6 +8169,12 @@ APP_DEFAULTS: dict[str, Any] = {
     # Requests sent in parallel when "sequential" is off (1-8). Feeds both the
     # engine's concurrency_limit and the wizard's duration estimate.
     "translate_parallel": 4,
+    # Sampler temperature override for LLM engines. ``None`` means "leave the
+    # engine's own default" (DeepSeek ships 1.3, Gemini 0.9, the generic ones
+    # 1.0). The low value that keeps short segments from drifting lives on
+    # OpenRouter's engine class; set this (or the per-engine "temperature") to
+    # force a value for every engine.
+    "translate_temperature": None,
     "filter_scope": "text",
     "rule_mode": "normal",
     "ebook_metadata": {"metadata_translation": False},
@@ -8159,7 +8224,7 @@ APP_DEFAULTS: dict[str, Any] = {
 #: Preference keys surfaced by the GUI for the selected engine.
 _ENGINE_PREFERENCE_KEYS = (
     "api_keys", "model", "prompt", "target_lang", "concurrency_limit",
-    "endpoint", "models_url")
+    "endpoint", "models_url", "temperature")
 
 
 def ensure_defaults() -> None:
@@ -8167,9 +8232,21 @@ def ensure_defaults() -> None:
     config = get_config()
     changed = False
     for key, value in APP_DEFAULTS.items():
+        # ``None`` means "no default": leave the engine's own value alone
+        # instead of writing a null into the config.
+        if value is None:
+            continue
         if config.preferences.get(key) is None:
             config.set(key, value)
             changed = True
+    # One-time migration: the first cut of the low-temperature default wrote
+    # ``translate_temperature = 0.2`` for every engine; the value now lives on
+    # the OpenRouter engine class, so drop the global override it left behind.
+    if not config.preferences.get("temperature_default_v2"):
+        if config.get("translate_temperature") == 0.2:
+            config.delete("translate_temperature")
+        config.set("temperature_default_v2", True)
+        changed = True
     # One-time migration: the reader backend default became "auto" (full when
     # WebEngine is available, otherwise lite). Bump legacy "lite" users.
     if not config.preferences.get("reader_backend_default_v2"):
@@ -8277,6 +8354,53 @@ def engine_names() -> list[str]:
     return names
 
 
+def _engine_is_configured(name: str) -> bool:
+    """True when the engine has been chosen and can run.
+
+    Two families, two answers:
+
+    * a curated provider is chosen through its **slot** — the switch the Provider
+      page owns, and the authoritative one: a provider whose slot is gone must
+      disappear even if something left credentials behind in
+      ``engine_preferences`` (a mirror left over by a removed slot is not a sign
+      that the user still wants that engine);
+    * a verbatim engine (ChatGPT, Gemini, …) has no slot: it counts as configured
+      once the Settings *Translation* page — or the translation wizard — stored a
+      key or a custom endpoint for it.
+    """
+    provider_id = provider_id_for_engine(name)
+    if provider_id and any(slot.get("provider") == provider_id
+                           and slot.get("enabled")
+                           for slot in provider_slots()):
+        return True
+    pref = get_engine_preference(name)
+    return bool(pref.get("api_keys")) or bool(pref.get("endpoint"))
+
+
+def desktop_engine_names() -> list[str]:
+    """The *selection* list of the desktop: non-LLM always, LLM once configured.
+
+    The plain machine-translation engines are what the app can do out of the box,
+    so they are always offered; an LLM appears only after the user has configured
+    it (a provider slot with credentials, or a key stored for one of the verbatim
+    engines such as ChatGPT). The configuration surfaces keep the full roster:
+    :func:`legacy_engine_names` for the plugin engines, :func:`provider_choices`
+    for the curated providers.
+
+    Desktop-only: the CLI uses :func:`engine_names`, which stays complete because
+    its TUI picks the engine *before* typing the API key.
+    """
+    names: list[str] = []
+    for engine in _builtin_engines():
+        if not engine.name:
+            continue
+        if engine_supports_prompt(engine.name) and not _engine_is_configured(
+                engine.name):
+            continue
+        names.append(engine.name)
+    return names
+
+
 def builtin_engine_names() -> list[str]:
     """The verbatim plugin engines only (no curated provider engines)."""
     provider_engines = _provider_engine_names()
@@ -8356,6 +8480,12 @@ def set_provider_slots(slots: list[dict[str, Any]]) -> None:
     translation path untouched.
     """
     config = get_config()
+    # Providers that were enabled *before* this call: a slot dropped from the
+    # list is never submitted, so its mirror would otherwise survive and keep the
+    # engine in the selection list.
+    previous_enabled = {
+        slot.get("provider") for slot in (config.get("provider_slots") or [])
+        if isinstance(slot, dict) and slot.get("enabled") and slot.get("provider")}
     normalized: list[dict[str, Any]] = []
     for item in (slots or [])[:MAX_PROVIDER_SLOTS]:
         slot = _blank_slot()
@@ -8384,6 +8514,13 @@ def set_provider_slots(slots: list[dict[str, Any]]) -> None:
             # mirrored engine config so a disabled provider is really inactive.
             set_engine_preference(
                 name, api_keys=[], model=None, endpoint=None)
+    # Same for a provider whose slot disappeared from the list entirely: without
+    # this, its stale mirror would keep the engine selectable.
+    for provider_id in previous_enabled - {
+            slot["provider"] for slot in normalized if slot["enabled"]}:
+        set_engine_preference(
+            provider_catalog.engine_name(provider_id),
+            api_keys=[], model=None, endpoint=None)
 
 
 def _slots_from_engine_preferences() -> list[dict[str, Any]]:
@@ -8701,6 +8838,26 @@ def _apply_settings(settings: dict[str, Any] | None) -> None:
     for key, value in settings.items():
         config.set(key, value)
     config.commit()
+
+
+def _apply_translation_defaults(translator) -> None:
+    """Apply the optional app-level sampler override.
+
+    ``translate_temperature`` is ``None`` by default: the engine keeps its own
+    temperature (DeepSeek ships 1.3, Gemini 0.9, the generic ones 1.0). Set it
+    (or the per-engine ``temperature``) to force a value — a low one keeps
+    short, context-free segments like chapter titles from drifting.
+    """
+    temperature = get_config().get("translate_temperature")
+    if temperature is None or not hasattr(translator, "temperature"):
+        return
+    engine_config = getattr(translator, "config", None) or {}
+    if "temperature" in engine_config:
+        return  # an explicit per-engine value wins
+    try:
+        translator.temperature = float(temperature)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -9096,6 +9253,7 @@ def collect_segments(
     translator.set_source_lang(source_lang)
     translator.set_target_lang(target_lang)
     book = epub.read_epub(input_path)
+    preserve_document_markup(book)
     if chapters:
         selected = resolve_selection(chapters_from_book(book), chapters)
         restrict_book(book, chapter_files(selected))
@@ -9152,6 +9310,7 @@ def translate_epub(
     translator = get_translator(engine_class)
     translator.set_source_lang(source_lang)
     translator.set_target_lang(target_lang)
+    _apply_translation_defaults(translator)
     style_prompt = (style_prompt or "").strip()
     if style_prompt and hasattr(translator, "prompt"):
         # *Append* the genre/style addendum: the engine's own prompt already
@@ -9172,6 +9331,7 @@ def translate_epub(
             f"{type(exc).__name__}: {exc}\n"
             "Il file sembra incompleto o malformato (il suo package document "
             "elenca risorse che non sono nell'archivio).") from exc
+    preserve_document_markup(book)
     if chapters:
         all_chapters = chapters_from_book(book)
         selected = resolve_selection(all_chapters, chapters)
@@ -9397,8 +9557,10 @@ def preview_translation(
     translator = get_translator(get_engine_class(engine))
     translator.set_source_lang(source_lang)
     translator.set_target_lang(target_lang)
+    _apply_translation_defaults(translator)
 
     book = epub.read_epub(input_path)
+    preserve_document_markup(book)
     if chapters:
         selected = resolve_selection(chapters_from_book(book), chapters)
         restrict_book(book, chapter_files(selected))
