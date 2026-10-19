@@ -3038,6 +3038,14 @@ class ChatgptTranslate(GenAI):
     top_p = 1.0
     stream = True
 
+    #: Provider-side reasoning control: ``None`` leaves the provider default,
+    #: ``False`` asks to skip it, a dict is passed through verbatim (OpenRouter
+    #: accepts ``{"enabled": false}`` / ``{"effort": "low"}`` …). Reasoning
+    #: tokens are billed as output and made short translations 2-3x slower in
+    #: the app's speed test, so the app turns it off by default; a value here or
+    #: in the engine config wins.
+    reasoning = None
+
     models: list[str] = []
     # TODO: Handle the default model more appropriately.
     model: str | None = 'gpt-4o'
@@ -3050,6 +3058,7 @@ class ChatgptTranslate(GenAI):
         self.temperature = self.config.get('temperature', self.temperature)
         self.top_p = self.config.get('top_p', self.top_p)
         self.stream = self.config.get('stream', self.stream)
+        self.reasoning = self.config.get('reasoning', self.reasoning)
         self.model = self.config.get('model', self.model)
 
     def get_models(self):
@@ -3079,6 +3088,14 @@ class ChatgptTranslate(GenAI):
             'User-Agent': 'Ebook-Translator/%s' % EbookTranslator.__version__
         }
 
+    def apply_reasoning(self, body: dict) -> dict:
+        """Add the provider's reasoning switch to a request body, if configured."""
+        if self.reasoning is not None:
+            body['reasoning'] = (
+                self.reasoning if isinstance(self.reasoning, dict)
+                else {'enabled': bool(self.reasoning)})
+        return body
+
     def get_body(self, text):
         body: dict[str, Any] = {
             'model': self.model,
@@ -3091,6 +3108,7 @@ class ChatgptTranslate(GenAI):
             body.update(stream=True)
         sampling_value = getattr(self, self.sampling)
         body.update({self.sampling: sampling_value})
+        self.apply_reasoning(body)
         return json.dumps(body)
 
     def get_result(self, response):
@@ -3834,6 +3852,11 @@ class OpenRouterTranslate(ChatgptTranslate):
     # the style. Per-engine/user settings can still override it.
     temperature = 0.2
 
+    #: OpenRouter accepts the ``reasoning`` object, so the caller may switch the
+    #: model's internal reasoning off. Opt-in on purpose: a vendor that does not
+    #: know the field answers 400, so no engine gets it unless it says so.
+    reasoning_supported = True
+
     # No persona of its own: the neutral prompt of ``ChatgptTranslate`` is the
     # right default for any genre. The per-book specialisation comes from the
     # app's genre analysis (style addendum appended by ``book.translate_epub``).
@@ -3892,7 +3915,8 @@ class OpenRouterTranslate(ChatgptTranslate):
             "messages": messages,
             "max_tokens": 8192,
         }
-        
+        self.apply_reasoning(data)
+
         # reasoning_effort for batch too
         if self.model and ("gpt-oss" in self.model or "o1" in self.model or "deepseek-reasoner" in self.model):
             data["reasoning_effort"] = "low"
@@ -3907,8 +3931,18 @@ class OpenRouterTranslate(ChatgptTranslate):
             }
             response = request(**params)
             
-            # Using ChatgptTranslate.get_result to extract content from OpenRouter's OpenAI-compatible response
-            result_text = self.get_result(response)
+            # Using ChatgptTranslate.get_result to extract content from OpenRouter's OpenAI-compatible response.
+            # The batch body is never streamed (``data`` has no ``stream`` key),
+            # so it must be parsed as a plain JSON response: ``get_result`` would
+            # take the streaming path whenever the engine default is
+            # ``stream=True`` (which it is) and fail with "'str' object has no
+            # attribute 'readline'".
+            streamed = self.stream
+            self.stream = False
+            try:
+                result_text = self.get_result(response)
+            finally:
+                self.stream = streamed
             if not result_text:
                 return None
                 
@@ -5839,6 +5873,10 @@ import concurrent.futures
 
 
 class Handler:
+    #: Ceiling for the loop's default executor. ``concurrency_limit == 0`` means
+    #: "one worker per segment", which must not become one *thread* per segment.
+    MAX_WORKERS = 32
+
     def __init__(self, paragraphs, concurrency_limit, translate_paragraph,
                  process_translation, request_interval):
         self.queue = asyncio.Queue()
@@ -5847,6 +5885,7 @@ class Handler:
         for paragraph in paragraphs:
             self.queue.put_nowait(paragraph)
 
+        self.requested_concurrency = concurrency_limit
         self.concurrency_limit = concurrency_limit or self.queue.qsize()
         self.translate_paragraph = translate_paragraph
         self.process_translation = process_translation
@@ -5916,6 +5955,14 @@ class Handler:
         except Exception:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+        # ``run_in_executor(None, ...)`` runs on the loop's *default* executor,
+        # and CPython sizes that one ``min(32, cpu+4)``: on a 4-core machine 8,
+        # so any concurrency above it was silently ignored and the extra workers
+        # just queued. Size the pool to the workers we are about to create.
+        if self.requested_concurrency:
+            workers = max(1, min(int(self.concurrency_limit), self.MAX_WORKERS))
+            loop.set_default_executor(
+                concurrent.futures.ThreadPoolExecutor(max_workers=workers))
         loop.run_until_complete(self.process_tasks())
 
 
@@ -8175,6 +8222,12 @@ APP_DEFAULTS: dict[str, Any] = {
     # OpenRouter's engine class; set this (or the per-engine "temperature") to
     # force a value for every engine.
     "translate_temperature": None,
+    # Ask engines that support it to skip the model's internal reasoning when
+    # translating (``{"reasoning": {"enabled": false}}``). Measured on OpenRouter
+    # with deepseek-v4-flash-0731: 2.5x faster and 3.5x cheaper, quality equal or
+    # better. Engines whose vendor does not accept the field are untouched
+    # (``reasoning_supported``), and an explicit per-engine "reasoning" wins.
+    "translate_reasoning": False,
     "filter_scope": "text",
     "rule_mode": "normal",
     "ebook_metadata": {"metadata_translation": False},
@@ -8224,7 +8277,7 @@ APP_DEFAULTS: dict[str, Any] = {
 #: Preference keys surfaced by the GUI for the selected engine.
 _ENGINE_PREFERENCE_KEYS = (
     "api_keys", "model", "prompt", "target_lang", "concurrency_limit",
-    "endpoint", "models_url", "temperature")
+    "endpoint", "models_url", "temperature", "request_interval", "reasoning")
 
 
 def ensure_defaults() -> None:
@@ -8679,6 +8732,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 from glob import glob
 from typing import Any, Callable, Iterable
@@ -8841,23 +8895,38 @@ def _apply_settings(settings: dict[str, Any] | None) -> None:
 
 
 def _apply_translation_defaults(translator) -> None:
-    """Apply the optional app-level sampler override.
+    """Apply the app-level sampler and reasoning overrides.
 
     ``translate_temperature`` is ``None`` by default: the engine keeps its own
     temperature (DeepSeek ships 1.3, Gemini 0.9, the generic ones 1.0). Set it
     (or the per-engine ``temperature``) to force a value — a low one keeps
     short, context-free segments like chapter titles from drifting.
+
+    ``translate_reasoning`` is ``False`` by default: the engines that accept it
+    (``reasoning_supported``, currently OpenRouter) are asked to skip the
+    model's internal reasoning. It cost 2.5x the wall time and 3.5x the money
+    for no quality gain in the speed test. A per-engine ``reasoning`` wins.
     """
-    temperature = get_config().get("translate_temperature")
-    if temperature is None or not hasattr(translator, "temperature"):
-        return
+    config = get_config()
     engine_config = getattr(translator, "config", None) or {}
-    if "temperature" in engine_config:
+
+    temperature = config.get("translate_temperature")
+    if (temperature is not None and hasattr(translator, "temperature")
+            and "temperature" not in engine_config):
+        try:
+            translator.temperature = float(temperature)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            pass
+
+    if "reasoning" in engine_config:
         return  # an explicit per-engine value wins
-    try:
-        translator.temperature = float(temperature)
-    except (TypeError, ValueError):  # pragma: no cover - defensive
-        pass
+    if not getattr(translator, "reasoning_supported", False):
+        return
+    reasoning = config.get("translate_reasoning")
+    if reasoning is None:
+        return
+    translator.reasoning = ({"enabled": bool(reasoning)}
+                            if isinstance(reasoning, bool) else reasoning)
 
 
 # ---------------------------------------------------------------------------
@@ -9411,7 +9480,10 @@ def translate_epub(
     paragraphs = cache.all_paragraphs()
     # How many calls this run will really make (used by the estimate's latency
     # calibration): everything already translated is served from the cache.
+    # ``engine_calls`` is only the *plan*; after the run the real count (which
+    # batching divides by 20 and retries raise) replaces it.
     engine_calls = sum(1 for paragraph in paragraphs if not paragraph.translation)
+    call_counter = _count_engine_calls(translator)
     if on_resume is not None:
         on_resume(*_cache_progress(cache))
 
@@ -9479,12 +9551,41 @@ def translate_epub(
     # Only now is the run really over: until this marker changes, opening the
     # book offers to continue it.
     _mark_finished(
-        cache, engine_calls=engine_calls, segments=len(paragraphs),
+        cache, engine_calls=call_counter["n"] or engine_calls,
+        segments=len(paragraphs),
         concurrency=int(getattr(translator, "concurrency_limit", 0) or 0),
         batching=bool(config.get("online_batching"))
         and hasattr(translator, "translate_batch"))
     cache.done()
     return output_path
+
+
+def _count_engine_calls(translator) -> dict[str, int]:
+    """Wrap the engine's entry points so the run can report real requests.
+
+    ``_mark_finished`` stores ``run_engine_calls`` and ``estimate`` uses it to
+    calibrate the seconds-per-call of the next duration estimate. With online
+    batching one request carries 20 segments, so counting *segments* there (the
+    old behaviour) made the calibration ~20x optimistic. Counting the calls the
+    engine actually makes is also the honest number for retries.
+    """
+    counter = {"n": 0}
+    lock = threading.Lock()
+    for name in ("translate", "translate_batch"):
+        original = getattr(translator, name, None)
+        if not callable(original):
+            continue
+
+        def wrapper(*args, _original=original, **kwargs):
+            with lock:
+                counter["n"] += 1
+            return _original(*args, **kwargs)
+
+        try:
+            setattr(translator, name, wrapper)
+        except (AttributeError, TypeError):  # pragma: no cover - defensive
+            continue
+    return counter
 
 
 def _persist_paragraph(cache, paragraph, on_paragraph,
