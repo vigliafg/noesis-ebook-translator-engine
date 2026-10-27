@@ -69,14 +69,26 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          choco install nsis -y --no-progress
-          # Extract version from the git tag (strip leading 'v')
+          # choco può fallire in modo transitorio: retry + ricerca esplicita
+          # di makensis (x86 e x64) prima di dichiarare errore.
+          choco install nsis -y --no-progress || choco upgrade nsis -y --no-progress || true
+          NSIS="$(command -v makensis || true)"
+          if [ -z "$NSIS" ]; then
+            for candidate in "/c/Program Files (x86)/NSIS/makensis.exe" "/c/Program Files/NSIS/makensis.exe"; do
+              if [ -x "$candidate" ]; then NSIS="$candidate"; break; fi
+            done
+          fi
+          if [ -z "$NSIS" ]; then
+            echo "makensis non trovato dopo l'installazione" >&2
+            ls -la "/c/Program Files" "/c/Program Files (x86)" || true
+            exit 1
+          fi
+          "$NSIS" -VERSION
           V="${GITHUB_REF#refs/tags/v}"
-          # Fallback for manual runs / non-tag pushes
           [[ "$V" == "$GITHUB_REF" ]] && V="0.0.0-dev"
           echo "NSIS VERSION=$V"
-          export PATH="/c/Program Files (x86)/NSIS:$PATH"
-          MSYS_NO_PATHCONV=1 makensis "/DVERSION=$V" installer.nsi
+          export PATH="$(dirname "$NSIS"):$PATH"
+          MSYS_NO_PATHCONV=1 "$NSIS" "/DVERSION=$V" installer.nsi
           ls -la noesis-ebook-translator-engine-*-setup.exe
 
       - name: Package artifact
