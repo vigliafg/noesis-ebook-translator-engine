@@ -10205,7 +10205,30 @@ def run_preview(args) -> int:
 
 
 # --------------------------------------------------------------------- TUI
-def _make_tui_app():
+def _tui_initial(args) -> dict:
+    """Values from the CLI to prefill the TUI wizard (``{}`` when no args).
+
+    Only explicit information is carried over; it mirrors the desktop wizard
+    and the lite engine's ``-gui libro.pdf --dst en`` behaviour.
+    """
+    if args is None:
+        return {}
+    initial = {
+        "input": getattr(args, "input", None) or "",
+        "output": getattr(args, "output", None) or "",
+        "engine": getattr(args, "engine", None) or "Google(Free)New",
+        "source": getattr(args, "source", None) or "English",
+        "target": getattr(args, "target", None) or "Italian",
+        "position": getattr(args, "position", None) or "only",
+        "cache": not bool(getattr(args, "no_cache", False)),
+        "batch": bool(getattr(args, "batch", False)),
+        "api_key": getattr(args, "api_key", None) or "",
+        "model": getattr(args, "model", None) or "",
+    }
+    return initial
+
+
+def _make_tui_app(initial: dict | None = None):
     """Build (and return) the Textual App class, or ``None`` if unavailable."""
     try:
         from textual import work
@@ -10216,6 +10239,12 @@ def _make_tui_app():
     except Exception:  # noqa: BLE001 - textual is optional
         return None
 
+    initial = dict(initial or {})
+    engine_names_list = list(engine_names())
+    selected_engine = initial.get("engine") or "Google(Free)New"
+    if selected_engine not in engine_names_list:
+        selected_engine = "Google(Free)New"
+
     class TranslationApp(App):
         CSS = """
         Screen { layout: vertical; }
@@ -10223,27 +10252,41 @@ def _make_tui_app():
         #row1, #row2 { height: auto; }
         #log { height: 1fr; border: round $accent; }
         """
-        BINDINGS = [("q", "quit", "Quit"), ("ctrl+r", "run", "Run")]
+        BINDINGS = [
+            ("q", "quit", "Quit"),
+            ("ctrl+r", "run", "Run"),
+            ("question_mark", "help", "Help"),
+        ]
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
             with Vertical(id="form"):
-                yield Input(placeholder="EPUB file path", id="input")
+                yield Input(value=initial.get("input", ""),
+                            placeholder="EPUB file path", id="input")
                 yield Select(
-                    [(n, n) for n in engine_names()],
-                    prompt="Engine", id="engine", value="Google(Free)New")
-                yield Input(value="English", placeholder="Source language",
-                            id="source")
-                yield Input(value="Italian", placeholder="Target language",
-                            id="target")
+                    [(n, n) for n in engine_names_list],
+                    prompt="Engine", id="engine", value=selected_engine)
+                yield Input(value=initial.get("source", "English"),
+                            placeholder="Source language", id="source")
+                yield Input(value=initial.get("target", "Italian"),
+                            placeholder="Target language", id="target")
+                yield Select(
+                    [("Translation only", "only"),
+                     ("Bilingual — below", "below"),
+                     ("Bilingual — above", "above")],
+                    prompt="Translation position", id="position",
+                    value=initial.get("position", "only"))
                 with Horizontal(id="row1"):
-                    yield Checkbox("Bilingual output", id="bilingual")
-                    yield Checkbox("Use cache", value=True, id="cache")
-                    yield Checkbox("Online batching", id="batch")
+                    yield Checkbox("Use cache", value=initial.get("cache", True),
+                                   id="cache")
+                    yield Checkbox("Online batching",
+                                   value=initial.get("batch", False), id="batch")
                 with Horizontal(id="row2"):
-                    yield Input(placeholder="API key (if required)", id="api_key",
+                    yield Input(value=initial.get("api_key", ""),
+                                placeholder="API key (if required)", id="api_key",
                                 password=True)
-                    yield Input(placeholder="Model (optional)", id="model")
+                    yield Input(value=initial.get("model", ""),
+                                placeholder="Model (optional)", id="model")
                 yield Button("Translate", variant="primary", id="run")
                 yield ProgressBar(total=100, id="progress")
             yield RichLog(id="log", highlight=True, markup=True)
@@ -10255,6 +10298,15 @@ def _make_tui_app():
 
         def action_run(self) -> None:
             self._start()
+
+        def action_help(self) -> None:
+            self._log(
+                "[b]Noesis Ebook Translator — TUI[/b]\n"
+                "Ctrl+R run · q quit · ? help\n"
+                "Fields: EPUB · engine · source/target language · position · "
+                "cache · online batching · API key · model.\n"
+                "The output EPUB is written next to the input unless -o is used."
+            )
 
         def _widget(self, wtype, widget_id):
             try:
@@ -10277,9 +10329,9 @@ def _make_tui_app():
             target = self._widget(Input, "target").value.strip() or "Italian"
             api_key = self._widget(Input, "api_key").value.strip()
             model = self._widget(Input, "model").value.strip() or None
+            position = self._widget(Select, "position")
             settings = {
-                "translation_position": (
-                    "below" if self._widget(Checkbox, "bilingual").value else "only"),
+                "translation_position": getattr(position, "value", "only") or "only",
                 "cache_enabled": self._widget(Checkbox, "cache").value,
                 "online_batching": self._widget(Checkbox, "batch").value,
             }
@@ -10287,12 +10339,14 @@ def _make_tui_app():
                 set_engine_preference(
                     engine, api_keys=([api_key] if api_key else []), model=model)
             self._log(f"[b]Translating[/b] {input_path} ({source} -> {target})…")
-            self._run(input_path, engine, source, target, settings)
+            self._run(input_path, engine, source, target, settings,
+                      initial.get("output") or "")
 
         @work(thread=True)
-        def _run(self, input_path, engine, source, target, settings) -> None:
+        def _run(self, input_path, engine, source, target, settings,
+                 output_path: str = "") -> None:
             ensure_defaults()
-            output = default_output_path(input_path, target)
+            output = output_path or default_output_path(input_path, target)
 
             def progress(frac, msg):
                 bar = self._widget(ProgressBar, "progress")
@@ -10315,34 +10369,43 @@ def _make_tui_app():
     return TranslationApp
 
 
-def run_tui() -> int:
-    app_class = _make_tui_app()
+def run_tui(args=None) -> int:
+    initial = _tui_initial(args)
+    app_class = _make_tui_app(initial)
     if app_class is None:
-        return _fallback_wizard()
+        return _fallback_wizard(initial)
     app_class().run()
     return 0
 
 
-def _fallback_wizard() -> int:
+def _fallback_wizard(initial: dict | None = None) -> int:
     """Line-based wizard used when Textual is not installed."""
+    initial = dict(initial or {})
+
+    def ask(prompt: str, default: str) -> str:
+        shown = f" [{default}]" if default else ""
+        value = input(f"{prompt}{shown}: ").strip().strip("'\"")
+        return value or default
+
     print("Textual not installed — simple wizard (install `textual` for the TUI).\n")
-    input_path = input("EPUB path: ").strip().strip("'\"")
+    input_path = ask("EPUB path", initial.get("input", ""))
     if not input_path:
         print("No input given.", file=sys.stderr)
         return 1
     print("Engines:", ", ".join(engine_names()))
-    engine = input("Engine [Google(Free)New]: ").strip() or "Google(Free)New"
-    source = input("Source language [English]: ").strip() or "English"
-    target = input("Target language [Italian]: ").strip() or "Italian"
+    engine = ask("Engine", initial.get("engine") or "Google(Free)New")
+    source = ask("Source language", initial.get("source") or "English")
+    target = ask("Target language", initial.get("target") or "Italian")
     ensure_defaults()
-    output = default_output_path(input_path, target)
+    output = initial.get("output") or default_output_path(input_path, target)
 
     def progress(frac, msg):
         _cli_progress(frac, msg)
 
     path = translate_epub(
         input_path, output, engine=engine, source_lang=source,
-        target_lang=target, settings={"translation_position": "only"},
+        target_lang=target,
+        settings={"translation_position": initial.get("position", "only")},
         on_progress=progress)
     print(f"Done: {path}")
     return 0
@@ -10395,7 +10458,7 @@ def main(argv=None) -> int:
         _print_chapters(args.input)
         return 0
     if args.gui:
-        return run_tui()
+        return run_tui(args)
     if not args.input:
         parser.error("the input EPUB file is required (or use -gui)")
     if args.preview:

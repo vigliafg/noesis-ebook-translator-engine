@@ -97,8 +97,13 @@ jobs:
               # The standalone binary is wrapped in a .dmg for distribution.
               mkdir -p dmg
               cp "dist/noesis-ebook-translator-engine" dmg/
-              hdiutil create -volname "Noesis Ebook Translator Engine" \
-                -srcfolder dmg -ov -format UDZO "$BASE.dmg"
+              # hdiutil può fallire con EBUSY transitorio sui runner.
+              for attempt in 1 2 3; do
+                hdiutil create -volname "Noesis Ebook Translator Engine" \
+                  -srcfolder dmg -ov -format UDZO "$BASE.dmg" && break
+                sleep 5
+              done
+              test -f "$BASE.dmg"
               ;;
           esac
           ls -la
@@ -203,6 +208,11 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

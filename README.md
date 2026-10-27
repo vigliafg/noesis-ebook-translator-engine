@@ -1,5 +1,8 @@
 # Noesis Ebook Translator — Engine (CLI + TUI)
 
+[![tests](https://github.com/vigliafg/noesis-ebook-translator-engine/actions/workflows/tests.yml/badge.svg)](https://github.com/vigliafg/noesis-ebook-translator-engine/actions/workflows/tests.yml)
+[![release](https://github.com/vigliafg/noesis-ebook-translator-engine/actions/workflows/release.yml/badge.svg)](https://github.com/vigliafg/noesis-ebook-translator-engine/actions/workflows/release.yml)
+
 **`noesis-ebook-translator-engine`** è l'edizione **da riga di comando** del
 motore di [Noesis Ebook Translator](https://github.com/vigliafg/noesis-ebook-translator):
 traduce un **EPUB** in un'altra lingua conservando la formattazione, i **markup
@@ -240,6 +243,11 @@ noesis-ebook-translator-engine -gui libro.epub -t French
 | `-s`, `--source LANG` | nome lingua | `English` | Lingua di origine. |
 | `-t`, `--target LANG` | nome lingua | `Italian` | Lingua di destinazione. |
 | `--position` | `only` · `below` · `above` | `only` | Posizione della traduzione: solo traduzione, oppure bilingue sotto/sopra l'originale. |
+| `--chapters SPEC` | lista/href | tutto | Traduce/esporta solo i capitoli indicati (`1,3,5-7` oppure href). |
+| `--export-format FMT` | vedi sotto | per tipo | Formato di export: `epub|html|md|txt` (capitoli), `img|html|md` (figure), `csv|html|md` (tabelle). |
+| `--export-only KIND` | `figures` · `tables` · `text` | — | Estrae invece di tradurre. |
+| `--preview N` | intero | — | Mostra N segmenti tradotti ed esce (anteprima offline). |
+| `--list-chapters` | flag | — | Elenca i capitoli del libro ed esce. |
 | `--batch` | flag | off | Abilita il **batching online** delle richieste. |
 | `--no-cache` | flag | off | Disabilita la **cache** su disco. |
 | `--api-key KEY` | stringa | — | Chiave API per il motore scelto (se richiesta). |
@@ -247,6 +255,11 @@ noesis-ebook-translator-engine -gui libro.epub -t French
 | `-gui`, `--gui` | flag | off | Avvia la **TUI** interattiva (o il wizard a righe). |
 | `--list-engines` | flag | — | Elenca i motori disponibili ed esce. |
 | `--version` | flag | — | Stampa la versione ed esce. |
+
+> `--export-format` viene validato in base a `--export-only`: per i capitoli
+> (`epub/html/md/txt`), per le figure (`img/html/md`) e per le tabelle
+> (`csv/html/md`). I formati non validi per il tipo scelto producono un errore
+> esplicito.
 
 ---
 
@@ -259,13 +272,21 @@ noesis-ebook-translator-engine -gui
 ```
 
 Si apre una schermata Textual con: campo **EPUB**, scelta del **motore**, lingua
-di **origine** e **destinazione**, opzioni (*Testo bilingue*, *Usa cache*,
-*Batching online*), campo **chiave API** e **modello**, pulsante **Translate**,
-barra di avanzamento e log. Da tastiera: `Ctrl+R` per avviare, `q` per uscire.
+di **origine** e **destinazione**, **posizione della traduzione** (solo
+traduzione / bilingue sotto / bilingue sopra), opzioni (*Usa cache*, *Batching
+online*), campo **chiave API** e **modello**, pulsante **Translate**, barra di
+avanzamento e log. Da tastiera: `Ctrl+R` per avviare, `?` per l'aiuto, `q` per
+uscire.
+
+La TUI **eredita gli argomenti della CLI**: input, output (`-o`), motore,
+lingue, posizione, cache, batching, chiave e modello vengono precompilati.
 
 ```bash
-noesis-ebook-translator-engine -gui libro.epub -t German   # precompila l'input
+noesis-ebook-translator-engine -gui libro.epub -t German --position below
 ```
+
+Se Textual non è installato, lo stesso comando apre un wizard a righe con gli
+stessi valori precompilati tra parentesi quadre.
 
 Per la TUI moderna installa l'extra:
 
@@ -312,8 +333,22 @@ Le release standalone sono compilate con **PyInstaller** su runner nativi
 Il workflow `.github/workflows/release.yml` parte manualmente da
 **Actions → build-releases → Run workflow** oppure al push di un tag `v*`
 (es. `git tag v2.4.2 && git push --tags`), creando una **GitHub Release** con gli
-artefatti. Essendo un'app **da console**, il build PyInstaller **non** usa
-`--windowed`.
+artefatti e `SHA256SUMS.txt`. Essendo un'app **da console**, il build
+PyInstaller **non** usa `--windowed`.
+
+Nomi degli asset della release:
+
+```text
+noesis-ebook-translator-engine-windows-x64.exe
+noesis-ebook-translator-engine-windows-x64-setup.exe
+noesis-ebook-translator-engine-macos-x64.dmg
+noesis-ebook-translator-engine-macos-arm64.dmg
+noesis-ebook-translator-engine-x86_64.AppImage
+SHA256SUMS.txt
+```
+
+La versione `2.4.2` è quella dell'**engine** (la stessa incorporata nel desktop
+`noesis-ebook-translator` 0.10.0), non quella dell'app desktop.
 
 ### Build locale (opzionale)
 
