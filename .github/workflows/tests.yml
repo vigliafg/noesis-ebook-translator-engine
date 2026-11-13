@@ -41,3 +41,47 @@ jobs:
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
+
+  mcp-interop:
+    name: MCP interop (official client)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt mcp
+
+      - name: Validate the hand-written server with the official client
+        run: python -m unittest tests.test_mcp_interop -v
+
+  e2e-workflows:
+    name: E2E workflows (offline fallback corpus)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run the ten agent workflows
+        # The Rosen EPUB lives in the desktop repo, absent in CI: the harness
+        # falls back to tests/data/corpus and still exercises every workflow.
+        run: python scripts/e2e/run_all.py

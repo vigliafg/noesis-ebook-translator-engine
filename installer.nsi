@@ -3,7 +3,7 @@
 ;
 ; Usage:
 ;   makensis installer.nsi
-;   makensis /DVERSION=2.4.2 installer.nsi
+;   makensis /DVERSION=2.5.0 installer.nsi
 ;
 ; Produces: noesis-ebook-translator-engine-${VERSION}-setup.exe
 ;
@@ -18,7 +18,7 @@
 ; Configurable defines (override with /D on the command line)
 ; -------------------------------------------------------------------
 !ifndef VERSION
-  !define VERSION "2.4.2"
+  !define VERSION "2.5.0"
 !endif
 
 !define PRODUCT_NAME      "Noesis Ebook Translator Engine"

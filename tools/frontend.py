@@ -3,6 +3,8 @@
 #
 #  This block is *not* generated: it is kept verbatim from tools/frontend.py and
 #  is what turns the inlined engine above into a command-line / terminal app.
+#  It is appended **last**, after the agent layer (tools/agent.py), so ``main``
+#  can dispatch ``--mcp`` to ``serve_mcp``.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import argparse
@@ -26,6 +28,131 @@ def _print_engine_list() -> None:
             print(f"      models: {', '.join(models)}")
 
 
+# ------------------------------------------------- machine (agent) output
+def _json_print(payload) -> None:
+    print(json.dumps(_agent_jsonable(payload), ensure_ascii=False, indent=2))
+
+
+def _json_event(kind: str, data) -> None:
+    print(json.dumps({"type": kind, "data": _agent_jsonable(data)},
+                     ensure_ascii=False), flush=True)
+
+
+def _agent_cli_params(args) -> dict:
+    return {
+        "input": args.input,
+        "output": args.output,
+        "engine": args.engine,
+        "model": args.model,
+        "api_key": args.api_key,
+        "source_lang": args.source,
+        "target_lang": args.target,
+        "chapters": args.chapters,
+        "position": args.position or "only",
+        "cache": not args.no_cache,
+        "batching": bool(args.batch),
+        "style": args.style or "",
+        "genre": args.genre or "",
+    }
+
+
+def _json_boundary(args, exc: BaseException) -> int:
+    info = agent_error(exc)
+    if getattr(args, "json_stream", False):
+        _json_event("error", info)
+    elif getattr(args, "json", False) or getattr(args, "dry_run", False):
+        _json_print({"ok": False, "error": info})
+    print(f"Error: {info['message']}", file=sys.stderr)
+    return 1
+
+
+def run_agent_cli(args) -> int:
+    """Machine-readable translate/plan/export (``--json``, ``--dry-run``)."""
+    try:
+        if args.dry_run:
+            _json_print(agent_plan(
+                args.input, engine=args.engine or "", model=args.model or "",
+                source_lang=args.source, target_lang=args.target,
+                chapters=args.chapters, batching=bool(args.batch)))
+            return 0
+        if args.export_only:
+            kind = "chapters" if args.export_only == "text" else args.export_only
+            fmt = args.export_format or ("txt" if kind == "chapters" else "")
+            _json_print(agent_export(
+                args.input, kind=kind, fmt=fmt, output=args.output or "",
+                chapters=args.chapters, target_lang=args.target))
+            return 0
+        params = _agent_cli_params(args)
+        if args.json_stream:
+            last = {"log": 0.0, "progress": 0.0}
+
+            def progress(fraction, message):
+                now = time.time()
+                if now - last["progress"] < 0.25 and fraction < 1.0:
+                    return
+                last["progress"] = now
+                _json_event("progress",
+                            {"fraction": fraction, "message": message})
+
+            def log_line(text, error=False):
+                now = time.time()
+                if not error and now - last["log"] < 0.5:
+                    return
+                last["log"] = now
+                _json_event("log", {"text": text, "error": bool(error)})
+
+            payload = agent_translate_now(
+                params, on_progress=progress, on_log=log_line)
+            _json_event("result", payload)
+            return 0
+        _json_print(agent_translate_now(params))
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:  # noqa: BLE001 - CLI boundary
+        return _json_boundary(args, exc)
+
+
+def _apply_resume(args) -> None:
+    """Prefill *unset* options from the newest interrupted run for the book."""
+    try:
+        runs = interrupted_runs(args.input)
+    except Exception as exc:  # noqa: BLE001 - best effort
+        print(f"Cannot look for interrupted runs: {exc}", file=sys.stderr)
+        return
+    if not runs:
+        print("No interrupted run found; starting from scratch.",
+              file=sys.stderr)
+        return
+    run = runs[0]
+    options = run.get("options") or {}
+    if not args.output and run.get("output_path"):
+        args.output = run["output_path"]
+    if not args.engine and run.get("engine"):
+        args.engine = run["engine"]
+    if not args.model and run.get("model"):
+        args.model = run["model"]
+    if args.source == "English" and run.get("source_lang"):
+        args.source = run["source_lang"]
+    if args.target == "Italian" and run.get("target_lang"):
+        args.target = run["target_lang"]
+    if not args.chapters and run.get("chapters"):
+        args.chapters = run["chapters"]
+    if args.position is None:
+        args.position = options.get("translation_position")
+    if "online_batching" in options:
+        args.batch = bool(options.get("online_batching"))
+    if "cache_enabled" in options:
+        args.no_cache = not bool(options.get("cache_enabled"))
+    if not args.style:
+        args.style = options.get("style_prompt") or ""
+    if not args.genre:
+        args.genre = options.get("genre") or ""
+    print(f"Resuming {run.get('title') or args.input}: "
+          f"{run.get('done', 0)}/{run.get('total', 0)} segments already done",
+          file=sys.stderr)
+
+
 def _print_chapters(path: str) -> None:
     for chapter in flatten(load_chapters(path)):
         indent = "  " * chapter.depth
@@ -34,9 +161,8 @@ def _print_chapters(path: str) -> None:
 
 
 def _selected_chapters(path: str, spec):
-    if not spec:
-        return None
-    return resolve_selection(load_chapters(path), spec)
+    """Resolve a chapter selection (index/list/href/file or a unique title)."""
+    return _agent_selection(path, spec)
 
 
 def _export_extra(args) -> int:
@@ -94,7 +220,12 @@ def run_cli(args) -> int:
     ensure_defaults()
     settings = _build_settings(args)
     engine = args.engine or "Google(Free)New"
-    selected = _selected_chapters(args.input, args.chapters) if args.chapters else None
+    try:
+        selected = _selected_chapters(args.input, args.chapters)
+    except Exception as exc:  # noqa: BLE001 - CLI boundary
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    chapters_spec = [chapter.index for chapter in selected] if selected else None
     target = args.output or default_output_path(args.input, args.target)
     fmt = (args.export_format or "epub").lower()
 
@@ -116,8 +247,9 @@ def run_cli(args) -> int:
         path = translate_epub(
             args.input, work_target, engine=engine,
             source_lang=args.source, target_lang=args.target,
-            chapters=args.chapters or None,
-            settings=settings, on_progress=_cli_progress, on_log=log)
+            chapters=chapters_spec,
+            settings=settings, on_progress=_cli_progress, on_log=log,
+            style_prompt=args.style or None, genre=args.genre or "")
         if fmt != "epub":
             written = export_chapters(path, target, None, fmt)
             path = written[0]
@@ -133,11 +265,16 @@ def run_cli(args) -> int:
 
 def run_preview(args) -> int:
     ensure_defaults()
+    try:
+        selected = _selected_chapters(args.input, args.chapters)
+    except Exception as exc:  # noqa: BLE001 - CLI boundary
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     pairs = preview_translation(
         args.input, engine=args.engine or "Google(Free)New",
         source_lang=args.source, target_lang=args.target,
-        chapters=args.chapters or None, limit=args.preview,
-        settings=_build_settings(args))
+        chapters=[chapter.index for chapter in selected] if selected else None,
+        limit=args.preview, settings=_build_settings(args))
     for original, translation in pairs:
         print(f"─ {original}")
         print(f"→ {translation}\n")
@@ -380,32 +517,101 @@ def main(argv=None) -> int:
     parser.add_argument("--no-cache", action="store_true", help="disable the cache")
     parser.add_argument("--api-key", help="API key for the selected engine")
     parser.add_argument("--model", help="model id for the selected engine")
+    parser.add_argument("--style", help="style/genre addendum for the LLM prompt")
+    parser.add_argument("--genre", help="book genre (stored with the run options)")
+    parser.add_argument("--resume", action="store_true",
+                        help="prefill options from the newest interrupted run")
     parser.add_argument("-gui", "--gui", action="store_true",
                         help="launch the terminal UI")
     parser.add_argument("--list-engines", action="store_true",
                         help="list available engines and exit")
     parser.add_argument("--version", action="store_true", help="print version and exit")
+    # ── agent-facing surface ───────────────────────────────────────────────
+    parser.add_argument("--json", action="store_true",
+                        help="machine-readable output (one JSON document)")
+    parser.add_argument("--json-stream", action="store_true",
+                        help="NDJSON events (progress|log|result|error)")
+    parser.add_argument("--describe", action="store_true",
+                        help="print the tool/capability manifest and exit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="plan and estimate only; nothing is written")
+    parser.add_argument("--cache-dir", help="stable cache directory")
+    parser.add_argument("--config-dir", help="isolated configuration directory")
+    parser.add_argument("--mcp", action="store_true",
+                        help="run the MCP stdio server (Content-Length framing)")
+    parser.add_argument("--root", action="append", default=[],
+                        help="allowed path root for --mcp (repeatable)")
+    parser.add_argument("--read-only", action="store_true",
+                        help="--mcp: forbid writes")
+    parser.add_argument("--verbose", action="store_true",
+                        help="--mcp: debug logging on stderr")
+    parser.add_argument("--max-output", type=int,
+                        help="--mcp: max characters returned by text tools")
     args = parser.parse_args(argv)
 
+    if args.config_dir or args.cache_dir:
+        try:
+            _agent_configure(config_dir_path=args.config_dir,
+                             cache_dir_path=args.cache_dir,
+                             configure_log=False)
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            parser.error(f"cannot apply --config-dir/--cache-dir: {exc}")
+
+    if args.mcp:
+        return serve_mcp(roots=args.root, config_dir=args.config_dir,
+                         cache_dir=args.cache_dir, read_only=args.read_only,
+                         verbose=args.verbose, max_output=args.max_output)
+    if args.describe:
+        _json_print(agent_describe())
+        return 0
     if args.version:
         print(f"noesis-ebook-translator-engine {__version__}")
         return 0
     if args.list_engines:
-        _print_engine_list()
+        if args.json:
+            _json_print(agent_list_engines())
+        else:
+            _print_engine_list()
         return 0
     if args.list_chapters:
         if not args.input:
             parser.error("--list-chapters requires an input EPUB")
-        _print_chapters(args.input)
+        if args.json:
+            try:
+                _json_print(agent_list_chapters(args.input))
+            except Exception as exc:  # noqa: BLE001 - CLI boundary
+                return _json_boundary(args, exc)
+        else:
+            _print_chapters(args.input)
         return 0
     if args.gui:
         return run_tui(args)
     if not args.input:
         parser.error("the input EPUB file is required (or use -gui)")
+    if args.resume:
+        _apply_resume(args)
     if args.preview:
+        if args.json:
+            try:
+                _json_print(agent_preview(
+                    args.input, engine=args.engine or "",
+                    model=args.model or "", source_lang=args.source,
+                    target_lang=args.target, chapters=args.chapters,
+                    limit=args.preview))
+            except Exception as exc:  # noqa: BLE001 - CLI boundary
+                return _json_boundary(args, exc)
+            return 0
         return run_preview(args)
+    if args.dry_run or args.json or args.json_stream:
+        return run_agent_cli(args)
     if args.export_only:
-        return _export_extra(args)
+        try:
+            return _export_extra(args)
+        except KeyboardInterrupt:
+            return 130
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
     return run_cli(args)
 
 

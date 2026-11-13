@@ -37,6 +37,8 @@ class TestSyncParity(unittest.TestCase):
         meta = json.loads((ROOT / "ENGINE_SOURCE.json").read_text(encoding="utf-8"))
         self.assertIn("desktop_commit", meta)
         self.assertIn("engines/__init__.py", meta.get("overrides", []))
+        self.assertEqual(meta.get("agent"), "tools/agent.py")
+        self.assertEqual(meta.get("frontend"), "tools/frontend.py")
 
     def test_fixtures_match_desktop(self):
         # The shared test corpus must be byte-identical to the desktop copy.

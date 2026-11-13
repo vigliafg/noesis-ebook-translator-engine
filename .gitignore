@@ -19,3 +19,5 @@ dist/
 work/
 logs/
 out/
+# E2E sample cache (derived from the parent repo's Rosen EPUB)
+scripts/e2e/.cache/

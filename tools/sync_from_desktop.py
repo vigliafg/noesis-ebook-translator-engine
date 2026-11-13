@@ -32,6 +32,12 @@ DEFAULT_DESKTOP = ROOT.parent / "noesis-ebook-translator"
 PACKAGE = "noesis_ebook_translator"
 OUTPUT = ROOT / "noesis_ebook_translator_engine.py"
 
+#: Hand-written blocks appended after the inlined engine, in this order:
+#: the agent layer (AgentAPI + MCP stdio server) and then the CLI/TUI
+#: front-end, whose ``main()`` can call ``serve_mcp``.
+AGENT = ROOT / "tools" / "agent.py"
+FRONTEND = ROOT / "tools" / "frontend.py"
+
 #: Modules inlined, in dependency order. Paths are relative to the desktop
 #: package directory (``noesis_ebook_translator/``).
 CORE_MODULES = [
@@ -157,7 +163,7 @@ except ImportError:  # pragma: no cover
 # ══════════════════════════════════════════════════════════════════════════════
 #  ``calibre`` compatibility layer (inlined; no Calibre required)
 # ══════════════════════════════════════════════════════════════════════════════
-version = (2, 4, 2)
+version = (2, 5, 0)
 __version__ = "v" + ".".join(str(part) for part in version)
 identifier = "noesis_ebook_translator_engine"
 author = "vigliafg"
@@ -405,11 +411,11 @@ def build_text(desktop: Path) -> str:
             raise SystemExit(f"missing desktop module: {src}")
         parts.append(BANNER.format(path=module))
         parts.append(_strip_imports(src.read_text(encoding="utf-8")).strip("\n"))
-    frontend = ROOT / "tools" / "frontend.py"
-    if not frontend.is_file():
-        raise SystemExit(f"missing frontend: {frontend}")
-    parts.append("\n\n")
-    parts.append(frontend.read_text(encoding="utf-8").strip("\n"))
+    for block in (AGENT, FRONTEND):
+        if not block.is_file():
+            raise SystemExit(f"missing hand-written block: {block}")
+        parts.append("\n\n")
+        parts.append(block.read_text(encoding="utf-8").strip("\n"))
     parts.append("\n")
     return "\n".join(parts)
 
@@ -479,6 +485,7 @@ def main(argv=None) -> int:
         "verbatim": VERBATIM,
         "overrides": OVERRIDES,
         "extensions": EXTENSIONS,
+        "agent": "tools/agent.py",
         "frontend": "tools/frontend.py",
         "fixtures": FIXTURE_DIRS,
         "data": DATA_FILES,
@@ -487,7 +494,7 @@ def main(argv=None) -> int:
         json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
     print(f"wrote {OUTPUT.name}: {len(text.splitlines())} lines, "
-          f"{len(CORE_MODULES)} modules + frontend")
+          f"{len(CORE_MODULES)} modules + agent + frontend")
     print(f"copied {fixtures} fixture files from {FIXTURE_DIRS}")
     print(f"copied {data_files} data files from {DATA_FILES}")
     print(f"desktop commit: {meta['desktop_commit'] or '(unknown)'}")
